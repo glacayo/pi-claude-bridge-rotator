@@ -15,7 +15,7 @@ Zero modifications to the bridge — the contract is the designed extension poin
   a profile in cooldown (rate limit) sends ALL traffic to the other; session
   affinity keeps a session on its profile so Claude Code `--resume` stays valid.
 - **Scope**: full management commands `/claude-accounts status|login|reset|probe`.
-- **Repo**: own nested git repo at `~/localhost/pi-claude-rotation`, branch
+- **Repo**: own nested git repo at `~/localhost/pi-claude-bridge-rotator` (directory renamed from `pi-claude-rotation` on 2026-10-01 to match the package name; git history intact), branch
   `feat/claude-bridge-rotator` (parent `~/localhost` repo left untouched).
 - **Contract authority**: `~/.pi/agent/npm/node_modules/@vanillagreen/pi-claude-bridge/src/account-router.ts`.
   Never mutate the contract; local type mirror only, no runtime import of bridge code.
