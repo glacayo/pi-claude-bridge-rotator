@@ -87,7 +87,18 @@ Zero modifications to the bridge — the contract is the designed extension poin
 
 Status at handoff: branch `feat/claude-bridge-rotator`; work-tree clean; HEAD `a0bed41`. Tasks 1–3 COMPLETE and verified: scaffold (`c009b1e`), config+state (`6c58b41`), router core (`a77a53c`) + cooldown-invariant fix (`a0bed41`). 69/69 tests, `npx tsc --noEmit` clean. Two independent verifier runs: Pass (initial minor finding fixed in `a0bed41`, re-verified Pass). Native assess was `unassessable` both times → high path → verifier (both Pass). No git remote; nothing pushed.
 
-Open native review (parked 2026-10-01, awaiting user decision): lineage `review-6e0032ea2de3585c` (compact-v2), state `reviewing`, tier medium, lens `review-reliability`, frozen candidate = committed range base `0871619d…`→ HEAD `76cae4b` (16 files / 3870 lines, correction budget 200). START succeeded without consent envelope; the single `reviewer_result` materialize slot (order 0) FAILED twice with `pi-host-relay-transport-failure` / `reviewer-empty-output` (`stopReason: length` — host model `glm-5.3` thinking consumes the output budget; run 1: 229s, run 2: 2.6s). `gentle-ai doctor` healthy (assets match 3.7.0) — NOT managed-asset drift; the standalone `assess` operation also fails `schema-incompatible`. Bound STATUS reoffers the slot: retry only after the reviewer relay transport is sane; never replay the binding from transcript inference. Do NOT start another lineage for this candidate or abandon without explicit user decision; the assess→verifier evidence for tasks 1–3 stands independently. Options parked with the user: continue with review pending / diagnose the relay first / abandon the lineage / disable the clone review switch.
+Native review CLOSED (2026-10-01): lineage `review-6e0032ea2de3585c` (compact-v2), candidate = committed range base `0871619d…`→ `76cae4b` (16 files / 3870 lines, tier medium, lens `review-reliability`). Root cause of the two prior reviewer transport failures: the host reviewer model `glm-5.3` (reasoning-heavy) consumed the entire output budget before emitting the review artifact (empty output, `stopReason: length`); the user swapped the reviewer-relay model to a better one, after which the materialize slot ran clean and the review closed **approved** on the last admitted event. The exact provider-issued acknowledgement was executed via native CLI with its exact token (facade `acknowledge-approved` was blocked by target drift: the current workspace target `sha256:6412d086…` differs from the frozen candidate `sha256:a5dca793…` because of the docs commit `e452c7e`); burn confirmed from its returned envelope: authority `burned`, consumed revision `sha256:45cda0c8…`. Review outcome is informational; delivery (push/PR/merge) remains user-owned. Do NOT start a review for the newer docs-only target identity — the delta over the approved candidate is documentation-only.
+
+Advisory findings from the native review (all non-blocking, disposition informational, no correction opened, separate later work):
+- R3-001 WARNING `src/state.ts:221-224`
+- R3-002 WARNING `src/router.ts:391-398`
+- R3-003 WARNING `test/router.test.ts:567-573`
+- R3-004 SUGGESTION `src/router.ts:355-366`
+- R3-005 SUGGESTION `src/router.ts:412-416`
+- R3-006 SUGGESTION `src/config.ts:131-141`
+- R3-007 SUGGESTION `src/state.ts:117-138`
+
+Full finding text lives in the native review store (`.git/gentle-ai/review-transactions/`); read the flagged line ranges when addressing them.
 
 1. Read this document fully — it is the authority for design, decisions, and contract facts.
 2. Recover context: `mem_context`, then `mem_search "pi-claude-bridge-rotator"`, `mem_get_observation` on the mirror (topic `odd/pi-claude-bridge-rotator/tasks`) and the research memory (topic `claude-account-rotation-strategy`).
