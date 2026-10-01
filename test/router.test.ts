@@ -367,13 +367,33 @@ describe("recordRateLimit reset parsing", () => {
 		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("a");
 	});
 
-	it("clears an existing cooldown when the reset time is already in the past", () => {
+	it("preserves an active cooldown when a past reset time arrives", () => {
 		const { router, now, store } = harness([profile("a")]);
-		router.recordRateLimit("a", { resetsAt: (now() + 10 * MINUTE_MS) / 1000 }, "m");
+		const untilMs = router.recordRateLimit("a", { resetsAt: (now() + 10 * MINUTE_MS) / 1000 }, "m");
 
-		router.recordRateLimit("a", { resetsAt: (now() - 10 * MINUTE_MS) / 1000 }, "m");
+		const returned = router.recordRateLimit("a", { resetsAt: (now() - 10 * MINUTE_MS) / 1000 }, "m");
 
-		expect(store.state.cooldowns.a).toBeUndefined();
+		// A past reset is skipped: it must never release a rate-limited account
+		// early, so the future-dated cooldown stays and is reported back.
+		expect(returned).toBe(untilMs);
+		expect(store.state.cooldowns.a?.untilMs).toBe(untilMs);
+		expect(captureThrow(() => router.acquire({ modelId: "m", sessionId: "s1" })))
+			.toBeInstanceOf(AllProfilesUnavailableError);
+	});
+
+	it("keeps the profile eligible when a past reset arrives over a stale expired record", () => {
+		const { router, now, advance, store } = harness([profile("a")]);
+		router.recordRateLimit("a", { resetsAt: (now() + MINUTE_MS) / 1000 }, "m");
+		advance(MINUTE_MS + 1);
+
+		const returned = router.recordRateLimit("a", { resetsAt: (now() - MINUTE_MS) / 1000 }, "m");
+
+		expect(returned).toBe(0);
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("a");
+		// The stale record may be cleaned or kept; either way it does not block.
+		if (store.state.cooldowns.a !== undefined) {
+			expect(store.state.cooldowns.a.untilMs).toBeLessThanOrEqual(now());
+		}
 	});
 
 	it("falls back to 30 minutes when the reset time is missing or unparseable", () => {
@@ -457,6 +477,33 @@ describe("session reporting and profile resolution", () => {
 		expect(router.current("m", "s2")).toEqual(second);
 		expect(router.current("m")).toEqual(second);
 		expect(router.current("m", "unknown-session")).toEqual(second);
+	});
+
+	it("bounds the session route cache by recency and falls back to the global route", () => {
+		const dir = makeTempDir();
+		const storePath = join(dir, "state.json");
+		const store = new RotatorStateStore({ statePath: storePath });
+		const router = new ClaudeAccountRouter({
+			profiles: [profile("a"), profile("b"), profile("c")],
+			state: store,
+			maxSessionRouteEntries: 2,
+		});
+		// Bind each session to a distinct profile so the routes differ by value.
+		router.recordSuccess("a", "s1");
+		router.recordSuccess("b", "s2");
+		router.recordSuccess("c", "s3");
+
+		const first = router.acquire({ modelId: "m", sessionId: "s1" });
+		router.acquire({ modelId: "m", sessionId: "s2" });
+		// Re-touch s1: it must become the most recent, evicting s2 not s1.
+		const firstAgain = router.acquire({ modelId: "m", sessionId: "s1" });
+		const third = router.acquire({ modelId: "m", sessionId: "s3" });
+
+		expect(firstAgain).toEqual(first);
+		expect(router.current("m", "s1")).toEqual(first);
+		expect(router.current("m", "s3")).toEqual(third);
+		// s2 was the least recently routed, so it fell out of the bound.
+		expect(router.current("m", "s2")).toEqual(third);
 	});
 
 	it("resolves the exact config dir and reports unknown ids as undefined", () => {

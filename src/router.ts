@@ -14,7 +14,7 @@
 // a cooldown.
 
 import type { RotatorConfig, RotatorProfileConfig } from "./config.js";
-import { cloneJsonValue, RotatorStateStore, touchSessionAffinity } from "./state.js";
+import { cloneJsonValue, MAX_SESSION_AFFINITY_ENTRIES, RotatorStateStore, touchSessionAffinity } from "./state.js";
 import type { JsonValue } from "./state.js";
 
 /** The bridge's published contract symbol (see contract authority above). */
@@ -122,6 +122,9 @@ export interface ClaudeAccountRouterOptions {
 	state: RotatorStateStore;
 	now?: (() => number) | undefined;
 	onWarn?: ((message: string) => void) | undefined;
+	/** Recency bound for the in-memory per-session route cache. Defaults to
+	 *  `MAX_SESSION_AFFINITY_ENTRIES`; injectable so tests can use a tiny bound. */
+	maxSessionRouteEntries?: number | undefined;
 }
 
 export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
@@ -133,8 +136,9 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 	private readonly now: () => number;
 	private readonly onWarn: (message: string) => void;
 	private readonly lastRouteBySession = new Map<string, ClaudeAccountRoute>();
+	private readonly maxSessionRouteEntries: number;
 	private lastGlobalRoute: ClaudeAccountRoute | undefined;
-	private warnedStateWrite = false;
+	private warnedOnce = false;
 
 	constructor(options: ClaudeAccountRouterOptions) {
 		this.profileList = [...options.profiles];
@@ -142,6 +146,10 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 		this.state = options.state;
 		this.now = options.now ?? (() => Date.now());
 		this.onWarn = options.onWarn ?? ((message: string) => console.warn(message));
+		const limit = options.maxSessionRouteEntries;
+		this.maxSessionRouteEntries = typeof limit === "number" && Number.isSafeInteger(limit) && limit >= 0
+			? limit
+			: MAX_SESSION_AFFINITY_ENTRIES;
 	}
 
 	acquire(input: ClaudeAccountAcquireInput): ClaudeAccountRoute {
@@ -185,10 +193,15 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 				this.setCooldown(profileId, untilMs, rateLimitType);
 				return untilMs;
 			}
-			// A reset time already in the past means the window is over: the
-			// profile is eligible again, so clear rather than invent a cooldown.
+			// A reset time already in the past is skipped: it must never shorten
+			// an active cooldown. `acquire` never routes to a cooling profile, so
+			// such a payload can only be a stale duplicate from a concurrent
+			// in-flight request; the service still enforces the limit, and the
+			// next genuine 429 re-records the cooldown anyway.
 			if (parsed <= nowMs) {
-				this.clearCooldown(profileId);
+				const existing = this.state.state.cooldowns[profileId];
+				if (existing !== undefined && existing.untilMs > nowMs) return existing.untilMs;
+				if (existing !== undefined) this.clearCooldown(profileId);
 				return 0;
 			}
 			const untilMs = Math.min(parsed, nowMs + MAX_COOLDOWN_MS);
@@ -294,8 +307,20 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 		if (profile === undefined) throw new AllProfilesUnavailableError(`Unknown Claude profile id "${profileId}".`);
 		const route: ClaudeAccountRoute = { profileId, label: profile.label, configDir: profile.configDir };
 		this.lastGlobalRoute = route;
-		if (sessionId !== undefined) this.lastRouteBySession.set(sessionId, route);
+		if (sessionId !== undefined) this.rememberRoute(sessionId, route);
 		return route;
+	}
+
+	/** Recency order mirrors the persisted session affinity: delete before
+	 *  re-set so a re-used session appends, then evict the oldest overflow. */
+	private rememberRoute(sessionId: string, route: ClaudeAccountRoute): void {
+		this.lastRouteBySession.delete(sessionId);
+		this.lastRouteBySession.set(sessionId, route);
+		while (this.lastRouteBySession.size > this.maxSessionRouteEntries) {
+			const oldest = this.lastRouteBySession.keys().next().value;
+			if (oldest === undefined) return;
+			this.lastRouteBySession.delete(oldest);
+		}
 	}
 
 	private isEligible(profileId: string, excluded: ReadonlySet<string>, nowMs: number): boolean {
@@ -385,8 +410,8 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 	}
 
 	private warn(message: string): void {
-		if (this.warnedStateWrite) return;
-		this.warnedStateWrite = true;
+		if (this.warnedOnce) return;
+		this.warnedOnce = true;
 		this.onWarn(`claude-bridge-rotator: ${message}`);
 	}
 }
