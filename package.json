@@ -1,7 +1,7 @@
 {
   "name": "pi-claude-bridge-rotator",
   "version": "0.1.0",
-  "description": "Rotates multiple Claude Pro subscription accounts for @vanillagreen/pi-claude-bridge.",
+  "description": "Rotates multiple Claude subscription accounts for @vanillagreen/pi-claude-bridge (requires the bridge).",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -10,7 +10,8 @@
     "claude",
     "claude-code",
     "claude-pro",
-    "account-rotation"
+    "account-rotation",
+    "pi-claude-bridge"
   ],
   "engines": {
     "node": ">=22"
@@ -34,5 +35,13 @@
     "@types/node": "^24.13.3",
     "typescript": "^5.9.3",
     "vitest": "^3.2.7"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/glacayo/pi-claude-bridge-rotator.git"
+  },
+  "homepage": "https://github.com/glacayo/pi-claude-bridge-rotator#readme",
+  "bugs": {
+    "url": "https://github.com/glacayo/pi-claude-bridge-rotator/issues"
   }
 }

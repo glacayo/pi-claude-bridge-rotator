@@ -1,7 +1,16 @@
 # pi-claude-bridge-rotator
 
+> **This package works only with
+> [`@vanillagreen/pi-claude-bridge`](https://github.com/vanillagreencom/kendex/tree/main/pi-extensions/pi-claude-bridge).**
+> It is a companion extension for that bridge, not a standalone tool. It
+> implements the bridge's account-router contract, and the bridge is the only
+> consumer of the routes it hands out. Without the bridge installed, the rotator
+> loads and reports status, but no request ever routes through it. It does not
+> work with any other Claude or pi provider. Developed and verified against
+> bridge `4.0.6`.
+
 A Pi companion extension for `@vanillagreen/pi-claude-bridge` that rotates
-multiple Claude Pro subscription accounts. It publishes the bridge's
+multiple Claude subscription accounts (Pro, Max, or Team). It publishes the bridge's
 `ClaudeAccountRouterV1` contract on `globalThis` under
 `Symbol.for("kendex.pi.claude-account-router.v1")`, so the bridge can hand each
 fresh Claude request to an eligible subscription profile: session affinity keeps
@@ -14,12 +23,15 @@ modified.
 
 - [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) with
   extension support (peer `>=0.86.0`; developed and verified against `0.99.1`).
-- `@vanillagreen/pi-claude-bridge` — the consumer of the router. Without it the
-  rotator loads and reports status, but nothing routes through it.
+- [`@vanillagreen/pi-claude-bridge`](https://github.com/vanillagreencom/kendex/tree/main/pi-extensions/pi-claude-bridge)
+  (**required**; verified against `4.0.6`) — the only consumer of the router.
+  Install and configure the bridge first. Without it the rotator loads and
+  reports status, but nothing routes through it.
 
 ## Install
 
 ```sh
+pi install git:github.com/glacayo/pi-claude-bridge-rotator   # from GitHub
 pi install pi-claude-bridge-rotator   # once published to npm
 pi install /path/to/pi-claude-bridge-rotator   # local checkout
 ```
