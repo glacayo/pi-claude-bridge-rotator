@@ -53,7 +53,8 @@ Zero modifications to the bridge — the contract is the designed extension poin
 - TDD mode: not configured (new project; no project/session/user TDD config) → ordinary functional checks; runner: `npx vitest run`; typecheck: `npx tsc --noEmit`. Tests ship with every work unit.
 - Delivery: local work-unit commits on `feat/claude-bridge-rotator`; no git remote configured (PR chaining N/A). Advisory ~400 authored changed lines per task.
 - Routes (delegation evidence): T1–T3 → one delegated writer (multi-file write rule; `gentle-ai-worker`, foreground); T4–T5 → delegated writer (Unit 2); T6 → delegated verify + parent install smoke; T7 → user.
-- Writer model: resolved by pi-subagents from config (see subagents.json).
+- Writer model: `ollama-cloud/deepseek-v4.1-flash`, effort `high` (resolved from subagents.json; used for Unit 1 and the cooldown fix run).
+- Native `assess` returned `unassessable` (schema-incompatible, no stderr) for both Unit 1 and the fix commit → per contract treated as high risk → independent `gentle-ai-verify` run for each; both Pass. Verified boundary: `a0bed41`.
 
 ## Non-goals (v1)
 
@@ -62,9 +63,9 @@ Zero modifications to the bridge — the contract is the designed extension poin
 
 ## Tasks
 
-- [ ] 1. Scaffold package (package.json with `pi` manifest, tsconfig, vitest, MIT LICENSE)
-- [ ] 2. Config + state modules with unit tests
-- [ ] 3. Router core `ClaudeAccountRouterV1` with TDD tests
+- [x] 1. Scaffold package (package.json with `pi` manifest, tsconfig, vitest, MIT LICENSE)
+- [x] 2. Config + state modules with unit tests
+- [x] 3. Router core `ClaudeAccountRouterV1` with TDD tests
 - [ ] 4. Extension entry: symbol publish/cleanup + bridge-absent warning
 - [ ] 5. Commands `/claude-accounts status|login|reset|probe`
 - [ ] 6. README + local `pi install` verification + smoke test
@@ -74,9 +75,9 @@ Zero modifications to the bridge — the contract is the designed extension poin
 
 | Task | Commit | Checks |
 |---|---|---|
-| 1 | (pending) | tsc --noEmit + vitest pass |
-| 2 | (pending) | config/state unit tests pass |
-| 3 | (pending) | router TDD tests pass, contract shape test |
+| 1 | c009b1e | `npx tsc --noEmit` clean; pi manifest + engines >=22; lock consistent |
+| 2 | 6c58b41 | config 16 + state 10 tests pass (26); tsc clean |
+| 3 | a77a53c + a0bed41 | 69/69 tests pass, tsc clean; independent verifier Pass (minor cooldown-invariant defect found, fixed in a0bed41, re-verified Pass) |
 | 4 | (pending) | vitest pass, manual load check |
 | 5 | (pending) | vitest pass, command registration check |
 | 6 | (pending) | pi list shows package, symbol resolution smoke |
@@ -84,16 +85,17 @@ Zero modifications to the bridge — the contract is the designed extension poin
 
 ## Resume instructions (for the next Pi session in this repo)
 
-Status at handoff: branch `feat/claude-bridge-rotator`; `main` holds only the `.gitignore` init commit (71b51ee). No source code written yet. Tasks 1–3 writer delegation was fully prepared but NOT launched — the previous session was bound to the parent `~/localhost` clone (started before this repo had its own `.git`), and session worktree tooling rejected this independent repo. A fresh session started in this repo binds correctly and needs no `repository_root` consent.
+Status at handoff: branch `feat/claude-bridge-rotator`; work-tree clean; HEAD `a0bed41`. Tasks 1–3 COMPLETE and verified: scaffold (`c009b1e`), config+state (`6c58b41`), router core (`a77a53c`) + cooldown-invariant fix (`a0bed41`). 69/69 tests, `npx tsc --noEmit` clean. Two independent verifier runs: Pass (initial minor finding fixed in `a0bed41`, re-verified Pass). Native assess was `unassessable` both times → high path → verifier (both Pass). No git remote; nothing pushed.
 
 1. Read this document fully — it is the authority for design, decisions, and contract facts.
 2. Recover context: `mem_context`, then `mem_search "pi-claude-bridge-rotator"`, `mem_get_observation` on the mirror (topic `odd/pi-claude-bridge-rotator/tasks`) and the research memory (topic `claude-account-rotation-strategy`).
-3. Rebuild the visible todo list from the Tasks section (tasks 1–7; task 1 in_progress).
-4. Delegate tasks 1–3 as ONE `gentle-ai-worker` run (multi-file write rule), foreground `mode: task`. Allowed edit surfaces (exact block, prose goes OUTSIDE the section): `package.json`, `package-lock.json`, `tsconfig.json`, `vitest.config.ts`, `LICENSE`, `README.md`, `.gitignore`, `src/**`, `test/**`.
-5. Worker verification: `npm install`, `npx tsc --noEmit`, `npx vitest run` (TDD off → tests ship with the unit).
-6. After the writer returns: review evidence, make work-unit commits (conventional messages), then `gentle_review` assess per RDD with writer profile `ollama-cloud/deepseek-v4.1-flash`, effort `high`.
-7. Then tasks 4–5 (entry + commands) as a second writer unit; task 6 (README + `pi install .` verification + smoke); task 7 is the user's live login of both accounts + rotation check.
-8. Contract facts for the worker prompt are in Architecture + Learnings above; the bridge authority file is read-only reference, never imported at runtime.
+3. Rebuild the visible todo list from the Tasks section (tasks 1–3 done; task 4 next).
+4. BEFORE delegating tasks 4–5, re-read the bridge extension mechanics: how `@vanillagreen/pi-claude-bridge` discovers the router symbol at runtime, its load/shutdown hooks, `probeProfile` usage, and the Pi extension API for command registration (`ctx.registerCommand` style; check bridge `src/index.ts` and the installed `@earendil-works/pi-coding-agent` extension types). Record exact API facts in this doc before writing the worker prompt.
+5. Delegate tasks 4–5 as ONE `gentle-ai-worker` run (Unit 2), foreground `mode: task`, writer model `ollama-cloud/deepseek-v4.1-flash` effort `high`. Allowed edit surfaces: `package.json`, `package-lock.json`, `README.md`, `src/**`, `test/**` (tsconfig/vitest/LICENSE/.gitignore exist; unit 2 needs the `@earendil-works/pi-coding-agent` devDep). Worker does NOT commit.
+6. Worker verification: `npx tsc --noEmit`, `npx vitest run` (node_modules already installed).
+7. After the writer returns: review evidence, make work-unit commits (conventional messages), then `gentle_review` assess per RDD with writer profile `ollama-cloud/deepseek-v4.1-flash`, effort `high`, baseRef `a0bed41`. If assess is `unassessable` again, run an independent `gentle-ai-verify` (read-only, authorized commands: tsc + vitest + scoped review points) as the high-risk path.
+8. Then task 6 (README + `pi install .` verification + smoke); task 7 is the user's live login of both accounts + rotation check.
+9. Contract facts for the worker prompt are in Architecture + Learnings above; the bridge authority file is read-only reference, never imported at runtime.
 
 ## Learnings so far
 
@@ -109,3 +111,19 @@ Status at handoff: branch `feat/claude-bridge-rotator`; `main` holds only the `.
   even with no `~/.claude`).
 - Bridge publishes `probeProfile` (10s deadline `/usage` child) we can call for
   identity/usage display; we do NOT need to publish a host ourselves.
+- Cooldown invariant (verified + fixed in `a0bed41`): a past-dated reset event never
+  clears an ACTIVE future-dated cooldown — `acquire` never routes to cooling
+  profiles, so such payloads are stale duplicates; the branch returns the existing
+  `untilMs` untouched, cleans stale expired records, and returns 0 otherwise.
+- `lastRouteBySession` (in-memory) is recency-bounded at
+  `MAX_SESSION_AFFINITY_ENTRIES` (delete+re-set on issue, evict least-recent);
+  evicted sessions fall back to the global route in `current()`.
+- The thrown `acquire` error carries `resetAtMs`/`rateLimitType` as real own
+  properties (class fields); under ES2022+ semantics even `undefined`-valued fields
+  satisfy the bridge's own-property reads.
+- `writeFileSync`'s `mode` is umask-subject: pair with explicit `chmodSync` to
+  guarantee the 0600 state file (verified in tests via `mode & 0o777`).
+- Env: `~/.npmrc` `before=2026-09-01T18:26:43Z` + `min-release-age=30d` can make
+  npm's resolver loop on the "before" cutoff; `npm install` exit 0 + vitest/tsc
+  resolving proves a consistent tree. A dev-only audit advisory on vitest <3.2.4
+  is resolved by the pinned `^3.2.7`.
