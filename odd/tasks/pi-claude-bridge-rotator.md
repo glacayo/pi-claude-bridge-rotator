@@ -112,6 +112,19 @@ Full finding text lives in the native review store (`.git/gentle-ai/review-trans
 
 ## Learnings so far
 
+### Extension API facts (recorded 2026-10-01, pre-Unit-2, from bridge src/index.ts + bridge-commands.ts + account-host.ts)
+
+- Pi extension entry contract: `export default function (pi: ExtensionAPI)` — pi calls it at load; `import { type ExtensionAPI } from "@earendil-works/pi-coding-agent"` (type-only import; no runtime dependency).
+- Command registration: `pi.registerCommand(name: string, { description: string, handler: async (args: string, ctx) => void })`. Handler `ctx` carries `.ui.notify(message, level)` (level "info"|"warning"|"error"), `.model?: Model`, `.sessionManager?.getSessionId?.()`, `.cwd?: string`. Bridge guards double registration with a process-global `Symbol.for("claude-bridge:commandsRegistered")` set on the `pi` object; the guard is NOT cleared on shutdown.
+- Lifecycle: `pi.on("session_start", (event, ctx) => ...)` (event.reason: new|resume|fork|startup), `pi.on("session_shutdown", (_event, ctx) => ...)`. Shutdown (incl. /reload) is where symbol cleanup goes; /reload re-runs the default export (fresh instance re-publishes).
+- Router discovery is order-independent: the bridge re-reads `globalThis[CLAUDE_ACCOUNT_ROUTER_SYMBOL]` fresh on every `resolveClaudeAccountRouter()` call — at load (availability), `session_start` re-upsert, pre-spawn fail-fast, and per fresh query. Rotator may load before or after the bridge.
+- Bridge-absent detection: the bridge publishes `globalThis[CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL = Symbol.for("kendex.pi.claude-bridge.account-host.v1")] = BRIDGE_ACCOUNT_HOST` at ITS load, primary instance only, and a config-disabled bridge returns BEFORE publishing (registerBridgeCommands still runs). So account-host symbol absence at `session_start` (all extensions loaded by then, unlike load-time where order decides) ⇒ bridge absent or disabled ⇒ warn once. 
+- `ClaudeBridgeAccountHostV1 = { version: 1, probeProfile(input: { profile: ClaudeAccountRoute; cwd: string; signal?: AbortSignal; deadlineMs?: number }) => Promise<{ identity?: { email?; organization?; subscriptionType?; authMethod? }; usage?: unknown }> }`. 10s default deadline (cold child spawn inside budget); spawns a `/usage` child under the profile's env scope. The rotator CONSUMES this for `/claude-accounts probe` — it publishes no host of its own.
+- Ownership pattern for global symbols (bridge): claim on load (`if (claimPrimaryInstance()) publish`), on shutdown clear ONLY if owned (`if (g[SYM] === OURS) g[SYM] = undefined`). A subagent reload must never steal or clear another instance's symbol.
+- `router.current(modelId, sessionId)` is called by the bridge's connector enumeration — signature confirmed live usage.
+- Host versions: pi 0.99.1, `@earendil-works/pi-coding-agent` 0.99.1 installed (bridge peer requires >=0.86.0). Rotator: devDependency `@earendil-works/pi-coding-agent` (types/tests only) + `peerDependencies >=0.86.0`; all runtime imports type-only.
+- Our manifest already declares `"pi": { "extensions": ["./src/index.ts"] }`; `src/index.ts` default export becomes the extension.
+
 - Bridge retry loop: up to `MAX_ROTATION_ATTEMPTS = 16`, acquire re-invoked with
   `excludedProfileIds`, `forceRerank: true` on retries, reason "automatic-failover".
 - `recordRateLimit` return value is IGNORED by the bridge — cooldown enforcement
