@@ -94,6 +94,105 @@ describe("RotatorStateStore loading", () => {
 	});
 });
 
+describe("usage state sanitization", () => {
+	it("defaults usage to an empty map when the field is missing", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		writeFileSync(statePath, JSON.stringify({ version: 1, cursor: 0 }));
+
+		const store = new RotatorStateStore({ statePath });
+
+		expect(store.state.usage).toEqual({});
+	});
+
+	it("keeps valid usage records and drops malformed entries", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		writeFileSync(statePath, JSON.stringify({
+			version: 1,
+			usage: {
+				a: {
+					snapshot: {
+						fetchedAtMs: 1000,
+						windows: {
+							five_hour: { utilization: 12.5, resetsAtMs: 2000 },
+							seven_day: { utilization: null, resetsAtMs: null },
+						},
+					},
+				},
+				b: { lastError: { reason: "network", atMs: 3000 } },
+				c: { snapshot: { fetchedAtMs: "soon", windows: {} } },
+				d: {
+					snapshot: {
+						fetchedAtMs: 4000,
+						windows: { five_hour: { utilization: "x", resetsAtMs: 1 }, seven_day: { utilization: 2, resetsAtMs: 3 } },
+					},
+				},
+				e: "not-an-object",
+				f: {},
+				g: { lastError: { reason: "not-a-reason", atMs: 1 } },
+			},
+		}));
+
+		const store = new RotatorStateStore({ statePath });
+
+		expect(Object.keys(store.state.usage).sort()).toEqual(["a", "b", "d"]);
+		expect(store.state.usage.a?.snapshot).toEqual({
+			fetchedAtMs: 1000,
+			windows: {
+				five_hour: { utilization: 12.5, resetsAtMs: 2000 },
+				seven_day: { utilization: null, resetsAtMs: null },
+			},
+		});
+		expect(store.state.usage.b?.lastError).toEqual({ reason: "network", atMs: 3000 });
+		expect(store.state.usage.d?.snapshot?.windows).toEqual({
+			seven_day: { utilization: 2, resetsAtMs: 3 },
+		});
+	});
+
+	it("clamps persisted utilization into 0-100 and keeps an http status", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		writeFileSync(statePath, JSON.stringify({
+			version: 1,
+			usage: {
+				a: {
+					snapshot: {
+						fetchedAtMs: 1000,
+						windows: {
+							five_hour: { utilization: 150, resetsAtMs: 2000 },
+							seven_day: { utilization: -5, resetsAtMs: 2000 },
+						},
+					},
+				},
+				b: { lastError: { reason: "http-error", atMs: 3000, httpStatus: 503 } },
+			},
+		}));
+
+		const store = new RotatorStateStore({ statePath });
+
+		expect(store.state.usage.a?.snapshot?.windows.five_hour?.utilization).toBe(100);
+		expect(store.state.usage.a?.snapshot?.windows.seven_day?.utilization).toBe(0);
+		expect(store.state.usage.b?.lastError).toEqual({ reason: "http-error", atMs: 3000, httpStatus: 503 });
+	});
+
+	it("round-trips a usage record through a reload", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		const store = new RotatorStateStore({ statePath });
+
+		store.update((state) => {
+			state.usage.a = {
+				snapshot: { fetchedAtMs: 1000, windows: { five_hour: { utilization: 12, resetsAtMs: 2000 } } },
+			};
+		});
+
+		const reloaded = new RotatorStateStore({ statePath });
+
+		expect(reloaded.state.usage.a?.snapshot?.windows.five_hour).toEqual({ utilization: 12, resetsAtMs: 2000 });
+	});
+});
+
 describe("RotatorStateStore persistence", () => {
 	it("round-trips state through a reload", () => {
 		const dir = makeTempDir();

@@ -541,6 +541,73 @@ describe("session reporting and profile resolution", () => {
 	});
 });
 
+describe("plan usage records", () => {
+	const snapshot = {
+		fetchedAtMs: START_MS,
+		windows: { five_hour: { utilization: 12, resetsAtMs: START_MS + HOUR_MS } },
+	};
+
+	it("stores a successful snapshot and clears any previous error", () => {
+		const { router, store } = harness([profile("a")]);
+		router.recordPlanUsage("a", { ok: false, reason: "network" });
+		expect(store.state.usage.a?.lastError?.reason).toBe("network");
+
+		router.recordPlanUsage("a", { ok: true, snapshot });
+
+		expect(store.state.usage.a?.snapshot).toEqual(snapshot);
+		expect(store.state.usage.a?.lastError).toBeUndefined();
+	});
+
+	it("keeps the previous snapshot and records the failure", () => {
+		const { router, store } = harness([profile("a")]);
+		router.recordPlanUsage("a", { ok: true, snapshot });
+
+		router.recordPlanUsage("a", { ok: false, reason: "http-error", httpStatus: 503 });
+
+		expect(store.state.usage.a?.snapshot).toEqual(snapshot);
+		expect(store.state.usage.a?.lastError).toEqual({ reason: "http-error", atMs: START_MS, httpStatus: 503 });
+	});
+
+	it("records a failure without a snapshot", () => {
+		const { router, store } = harness([profile("a")]);
+
+		router.recordPlanUsage("a", { ok: false, reason: "token-expired" });
+
+		expect(store.state.usage.a?.snapshot).toBeUndefined();
+		expect(store.state.usage.a?.lastError).toEqual({ reason: "token-expired", atMs: START_MS });
+	});
+
+	it("ignores an unknown profile", () => {
+		const { router, store } = harness([profile("a")]);
+
+		router.recordPlanUsage("missing", { ok: true, snapshot });
+
+		expect(store.state.usage).toEqual({});
+	});
+
+	it("exposes the stored record through planUsage and never throws", () => {
+		const { router } = harness([profile("a")]);
+		expect(router.planUsage("missing")).toBeUndefined();
+
+		router.recordPlanUsage("a", { ok: true, snapshot });
+
+		expect(router.planUsage("a")?.snapshot).toEqual(snapshot);
+		expect(() => router.recordPlanUsage("a", undefined as never)).not.toThrow();
+		expect(() => router.recordPlanUsage("missing", undefined as never)).not.toThrow();
+	});
+
+	it("persists the usage record to disk", () => {
+		const { router, store } = harness([profile("a")]);
+
+		router.recordPlanUsage("a", { ok: true, snapshot });
+
+		const persisted = JSON.parse(readFileSync(store.path, "utf8")) as {
+			usage: Record<string, { snapshot?: { fetchedAtMs: number } }>;
+		};
+		expect(persisted.usage.a?.snapshot?.fetchedAtMs).toBe(START_MS);
+	});
+});
+
 describe("fault isolation", () => {
 	it("never throws from record*, current, or resolveProfile on bad input", () => {
 		const { router, store } = harness([profile("a")]);

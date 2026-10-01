@@ -13,6 +13,8 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { piAgentDir } from "./config.js";
+import { USAGE_FAILURE_REASONS, USAGE_WINDOW_NAMES } from "./usage.js";
+import type { UsageFailureReason, UsageSnapshot, UsageWindow, UsageWindowName } from "./usage.js";
 
 export const ROTATOR_STATE_FILENAME = "claude-bridge-rotator-state.json";
 export const STATE_VERSION = 1;
@@ -50,6 +52,21 @@ export interface ProfileFailure {
 	atMs: number;
 }
 
+/** Last plan-usage failure per profile, for the `usage: unavailable — …` line. */
+export interface ProfileUsageError {
+	reason: UsageFailureReason;
+	atMs: number;
+	httpStatus?: number;
+}
+
+/** Normalized plan usage for one profile. On a failed refresh the previous
+ *  `snapshot` is deliberately kept alongside `lastError` so status can still
+ *  show the last known values. */
+export interface ProfileUsageRecord {
+	snapshot?: UsageSnapshot;
+	lastError?: ProfileUsageError;
+}
+
 export interface RotatorState {
 	version: number;
 	cooldowns: Record<string, CooldownRecord>;
@@ -60,6 +77,8 @@ export interface RotatorState {
 	cursor: number;
 	identity: Record<string, ProfileIdentity>;
 	failures: Record<string, ProfileFailure>;
+	/** Normalized plan usage per profile id (see `src/usage.ts`). */
+	usage: Record<string, ProfileUsageRecord>;
 }
 
 export interface RotatorStateStoreOptions {
@@ -111,6 +130,7 @@ export function emptyRotatorState(): RotatorState {
 		cursor: 0,
 		identity: {},
 		failures: {},
+		usage: {},
 	};
 }
 
@@ -198,7 +218,71 @@ function sanitizeState(raw: Record<string, unknown>): RotatorState {
 		}
 	}
 
+	if (isRecord(raw.usage)) {
+		for (const [profileId, value] of Object.entries(raw.usage)) {
+			const record = sanitizeProfileUsage(value);
+			if (record !== undefined) state.usage[profileId] = record;
+		}
+	}
+
 	return state;
+}
+
+/** Rebuild one persisted `usage` entry from untrusted JSON, dropping anything
+ *  malformed. A record with neither a usable snapshot nor a usable error is
+ *  dropped entirely, so a stray `{}` never renders an empty usage line. */
+function sanitizeProfileUsage(value: unknown): ProfileUsageRecord | undefined {
+	if (!isRecord(value)) return undefined;
+	const record: ProfileUsageRecord = {};
+	const snapshot = sanitizeUsageSnapshot(value.snapshot);
+	if (snapshot !== undefined) record.snapshot = snapshot;
+	const lastError = sanitizeUsageError(value.lastError);
+	if (lastError !== undefined) record.lastError = lastError;
+	return record.snapshot === undefined && record.lastError === undefined ? undefined : record;
+}
+
+function sanitizeUsageSnapshot(value: unknown): UsageSnapshot | undefined {
+	if (!isRecord(value)) return undefined;
+	const fetchedAtMs = value.fetchedAtMs;
+	if (typeof fetchedAtMs !== "number" || !Number.isFinite(fetchedAtMs)) return undefined;
+	if (!isRecord(value.windows)) return undefined;
+	const windows: Partial<Record<UsageWindowName, UsageWindow>> = {};
+	for (const name of USAGE_WINDOW_NAMES) {
+		const window = sanitizeUsageWindow(value.windows[name]);
+		if (window !== undefined) windows[name] = window;
+	}
+	return { fetchedAtMs, windows };
+}
+
+function sanitizeUsageWindow(value: unknown): UsageWindow | undefined {
+	if (!isRecord(value)) return undefined;
+	const utilization = value.utilization;
+	const normalizedUtilization = utilization === null
+		? null
+		: typeof utilization === "number" && Number.isFinite(utilization)
+			? Math.min(100, Math.max(0, utilization))
+			: undefined;
+	if (normalizedUtilization === undefined) return undefined;
+	const resetsAtMs = value.resetsAtMs;
+	const normalizedResetsAt = resetsAtMs === null
+		? null
+		: typeof resetsAtMs === "number" && Number.isFinite(resetsAtMs)
+			? resetsAtMs
+			: undefined;
+	if (normalizedResetsAt === undefined) return undefined;
+	return { utilization: normalizedUtilization, resetsAtMs: normalizedResetsAt };
+}
+
+function sanitizeUsageError(value: unknown): ProfileUsageError | undefined {
+	if (!isRecord(value)) return undefined;
+	const reason = value.reason;
+	if (typeof reason !== "string" || !(USAGE_FAILURE_REASONS as readonly string[]).includes(reason)) return undefined;
+	const atMs = value.atMs;
+	if (typeof atMs !== "number" || !Number.isFinite(atMs)) return undefined;
+	const error: ProfileUsageError = { reason: reason as UsageFailureReason, atMs };
+	const httpStatus = value.httpStatus;
+	if (typeof httpStatus === "number" && Number.isFinite(httpStatus)) error.httpStatus = httpStatus;
+	return error;
 }
 
 export class RotatorStateStore {

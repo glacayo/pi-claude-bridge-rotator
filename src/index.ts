@@ -46,6 +46,8 @@ export type {
 	JsonValue,
 	ProfileFailure,
 	ProfileIdentity,
+	ProfileUsageError,
+	ProfileUsageRecord,
 	RotatorState,
 	RotatorStateStoreOptions,
 } from "./state.js";
@@ -80,6 +82,7 @@ export type { ClaudeBridgeAccountHostV1, GlobalTarget } from "./host.js";
 
 export { createRotatorCommandHandler } from "./commands.js";
 export type {
+	FetchUsage,
 	NotifyLevel,
 	RotatorCommandContext,
 	RotatorCommandHandler,
@@ -89,6 +92,30 @@ export type {
 	RotatorUIContext,
 	StartLogin,
 } from "./commands.js";
+
+export {
+	CREDENTIALS_FILENAME,
+	DEFAULT_USAGE_TIMEOUT_MS,
+	fetchPlanUsage,
+	normalizeUsageResponse,
+	readOAuthAccessToken,
+	USAGE_ENDPOINT,
+	USAGE_FAILURE_REASONS,
+	USAGE_WINDOW_NAMES,
+} from "./usage.js";
+export type {
+	FetchPlanUsageOptions,
+	FetchUsageImpl,
+	FetchUsageResponse,
+	ReadFile,
+	ReadOAuthAccessTokenOptions,
+	ReadOAuthAccessTokenResult,
+	UsageFailureReason,
+	UsageFetchResult,
+	UsageSnapshot,
+	UsageWindow,
+	UsageWindowName,
+} from "./usage.js";
 
 export { DEFAULT_LOGIN_TIMEOUT_MS, startClaudeLogin } from "./login.js";
 export type {
