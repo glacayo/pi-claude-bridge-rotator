@@ -15,11 +15,22 @@ export {
 	expandHomePath,
 	loadConfig,
 	piAgentDir,
+	rotatorProfilesBaseDir,
 	RotatorConfigError,
 	ROTATOR_CONFIG_FILENAME,
+	saveConfig,
+	slugifyProfileId,
 	SUPPORTED_POLICIES,
+	uniqueProfileId,
 } from "./config.js";
-export type { ConfigLoadOptions, RotatorConfig, RotatorPolicy, RotatorProfileConfig } from "./config.js";
+export type {
+	ConfigLoadOptions,
+	RotatorConfig,
+	RotatorPolicy,
+	RotatorProfileConfig,
+	SaveConfigInput,
+	SaveConfigOptions,
+} from "./config.js";
 
 export {
 	cloneJsonValue,
@@ -74,8 +85,21 @@ export type {
 	RotatorCommandHandler,
 	RotatorCommandOptions,
 	RotatorCommandState,
+	RotatorDialogOptions,
 	RotatorUIContext,
+	StartLogin,
 } from "./commands.js";
+
+export { DEFAULT_LOGIN_TIMEOUT_MS, startClaudeLogin } from "./login.js";
+export type {
+	ClaudeLoginHandle,
+	LoginStdin,
+	LoginStream,
+	SpawnedLoginProcess,
+	SpawnImpl,
+	SpawnLoginOptions,
+	StartClaudeLoginOptions,
+} from "./login.js";
 
 import { createRotatorCommandHandler } from "./commands.js";
 import type { RotatorCommandState } from "./commands.js";
@@ -162,6 +186,30 @@ export function activateExtension(pi: ExtensionAPI, deps: RotatorExtensionDeps =
 	// when `/claude-accounts status` has to explain what is wrong, so the
 	// command registration above happens regardless.
 	const publisher = new RouterPublisher(globalTarget);
+	// Store the FIRST activation's publisher once: `/reload` re-runs this entry,
+	// and only the original owner may republish the process-global symbol.
+	if (state.publisher === undefined) state.publisher = publisher;
+
+	// Refresh hook shared across activations: reload the config from disk,
+	// rebuild the router, and republish through the stored owner. This is what
+	// makes a wizard-written profile live without `/reload`.
+	state.refresh = () => {
+		try {
+			const config: RotatorConfig = loadConfig({ configPath: deps.configPath, env: deps.env });
+			const router = createRouter(config, { env: deps.env, now: deps.now });
+			state.publisher?.publish(router);
+			state.config = config;
+			state.router = router;
+			state.configError = undefined;
+		} catch (error) {
+			// A failed reload must not unpublish the previous router: keep the
+			// symbol as-is and surface the error through the command state.
+			state.config = undefined;
+			state.router = undefined;
+			state.configError = describeError(error);
+		}
+	};
+
 	try {
 		const config: RotatorConfig = loadConfig({ configPath: deps.configPath, env: deps.env });
 		const router = createRouter(config, { env: deps.env, now: deps.now });
@@ -211,7 +259,13 @@ function registerCommandOnce(
 	guard[COMMANDS_REGISTERED_KEY] = true;
 	pi.registerCommand("claude-accounts", {
 		description: "Manage Claude subscription accounts (status|login|reset|probe)",
-		handler: createRotatorCommandHandler({ state, globalTarget, now: deps.now }),
+		handler: createRotatorCommandHandler({
+			state,
+			globalTarget,
+			now: deps.now,
+			configPath: deps.configPath,
+			env: deps.env,
+		}),
 	});
 }
 

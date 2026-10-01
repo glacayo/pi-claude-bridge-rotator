@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { writeFileSync } from "node:fs";
+import { readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { cleanupTempDirs, makeTempDir } from "./helpers.js";
@@ -8,8 +8,12 @@ import {
 	expandHomePath,
 	loadConfig,
 	piAgentDir,
+	rotatorProfilesBaseDir,
 	RotatorConfigError,
 	ROTATOR_CONFIG_FILENAME,
+	saveConfig,
+	slugifyProfileId,
+	uniqueProfileId,
 } from "../src/config.js";
 
 afterEach(cleanupTempDirs);
@@ -179,5 +183,62 @@ describe("path helpers", () => {
 		expect(expandHomePath("~/claude-a", "/home/tester")).toBe("/home/tester/claude-a");
 		expect(expandHomePath("/already/absolute", "/home/tester")).toBe("/already/absolute");
 		expect(expandHomePath("/tmp/~not-home", "/home/tester")).toBe("/tmp/~not-home");
+	});
+
+	it("uses ~/.claude-rotator as the wizard profile base", () => {
+		expect(rotatorProfilesBaseDir({})).toBe(join(homedir(), ".claude-rotator"));
+	});
+});
+
+describe("slugifyProfileId", () => {
+	it("lowercases and dashes non-alphanumeric runs", () => {
+		expect(slugifyProfileId("Personal")).toBe("personal");
+		expect(slugifyProfileId("My Work Account")).toBe("my-work-account");
+		expect(slugifyProfileId("Work__2")).toBe("work-2");
+		expect(slugifyProfileId("  --Edge--  ")).toBe("edge");
+	});
+
+	it("falls back to account when nothing survives", () => {
+		expect(slugifyProfileId("!!!")).toBe("account");
+		expect(slugifyProfileId("   ")).toBe("account");
+	});
+});
+
+describe("uniqueProfileId", () => {
+	it("returns the base when free and suffixes on collision", () => {
+		expect(uniqueProfileId([], "work")).toBe("work");
+		expect(uniqueProfileId(["work"], "work")).toBe("work-2");
+		expect(uniqueProfileId(["work", "work-2"], "work")).toBe("work-3");
+	});
+});
+
+describe("saveConfig", () => {
+	it("writes a 0600 file that roundtrips through loadConfig with no temp residue", () => {
+		const dir = makeTempDir();
+		const configPath = join(dir, ROTATOR_CONFIG_FILENAME);
+		const profiles = [
+			{ id: "personal", label: "Personal", configDir: join(homedir(), ".claude-rotator", "personal") },
+			{ id: "work", label: "Work", configDir: join(homedir(), ".claude-rotator", "work") },
+		];
+
+		const written = saveConfig({ policy: "balanced", profiles }, { configPath });
+
+		expect(written).toBe(configPath);
+		expect(statSync(configPath).mode & 0o777).toBe(0o600);
+		expect(loadConfig({ configPath }).profiles).toEqual(profiles);
+		expect(readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+	});
+
+	it("creates the agent directory and writes to the env default path", () => {
+		const dir = makeTempDir();
+		const configPath = join(dir, "nested", ROTATOR_CONFIG_FILENAME);
+
+		const written = saveConfig(
+			{ policy: "balanced", profiles: [{ id: "a", label: "A", configDir: "/tmp/accounts/a" }] },
+			{ env: { PI_CODING_AGENT_DIR: join(dir, "nested") } },
+		);
+
+		expect(written).toBe(configPath);
+		expect(loadConfig({ configPath }).profiles.map((entry) => entry.id)).toEqual(["a"]);
 	});
 });

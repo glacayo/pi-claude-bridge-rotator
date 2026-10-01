@@ -6,19 +6,43 @@
 // account-host symbol, the clock, and the filesystem `mkdir`. Unit tests
 // therefore exercise the real command logic with no pi runtime.
 
-import { mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import {
+	DEFAULT_POLICY,
+	resolveConfigPath,
+	rotatorProfilesBaseDir,
+	saveConfig,
+	slugifyProfileId,
+	uniqueProfileId,
+} from "./config.js";
 import type { RotatorConfig, RotatorProfileConfig } from "./config.js";
+import { startClaudeLogin } from "./login.js";
+import type { ClaudeLoginHandle } from "./login.js";
+import type { RouterPublisher } from "./index.js";
 import type { ClaudeAccountIdentity } from "./router.js";
 import { CLAUDE_ACCOUNT_ROUTER_SYMBOL, type ClaudeAccountRouter } from "./router.js";
 import type { ClaudeBridgeAccountHostV1, GlobalTarget } from "./host.js";
 import { DEFAULT_GLOBAL_TARGET, resolveBridgeAccountHost } from "./host.js";
-import type { ProfileIdentity, RotatorStateStore } from "./state.js";
+import type { RotatorStateStore } from "./state.js";
 
 export type NotifyLevel = "info" | "warning" | "error";
 
-/** Minimal UI surface the command needs; satisfied by pi's `ExtensionUIContext`. */
+/** Options accepted by pi's dialog APIs; mirrored so the real context satisfies
+ *  this interface structurally without importing its runtime types. */
+export interface RotatorDialogOptions {
+	signal?: AbortSignal | undefined;
+	timeout?: number | undefined;
+}
+
+/** Minimal UI surface the command needs; satisfied by pi's `ExtensionUIContext`.
+ *  The dialog methods are optional so JSON/print modes (no UI) still satisfy it
+ *  and fall back to the guidance flow. */
 export interface RotatorUIContext {
 	notify(message: string, level?: NotifyLevel): void;
+	select?(title: string, options: string[], opts?: RotatorDialogOptions): Promise<string | undefined>;
+	confirm?(title: string, message: string, opts?: RotatorDialogOptions): Promise<boolean>;
+	input?(title: string, placeholder?: string, opts?: RotatorDialogOptions): Promise<string | undefined>;
 }
 
 /** Minimal command context; satisfied by pi's `ExtensionCommandContext`. */
@@ -37,7 +61,19 @@ export interface RotatorCommandState {
 	router?: ClaudeAccountRouter | undefined;
 	config?: RotatorConfig | undefined;
 	configError?: string | undefined;
+	/** Owner-capable publisher stored by the first activation; the refresh hook
+	 *  republishes through it so a wizard write is live without `/reload`. */
+	publisher?: RouterPublisher | undefined;
+	/** Reload the config from disk and republish; set by the extension shell. */
+	refresh?: (() => void) | undefined;
 }
+
+/** Injected login driver: spawns `claude auth login` for one profile and
+ *  returns the handle used to submit the pasted code. */
+export type StartLogin = (options: {
+	configDir: string;
+	onOutput?: ((line: string) => void) | undefined;
+}) => Promise<ClaudeLoginHandle>;
 
 export interface RotatorCommandOptions {
 	state: RotatorCommandState;
@@ -45,6 +81,13 @@ export interface RotatorCommandOptions {
 	now?: (() => number) | undefined;
 	mkdirRecursive?: ((path: string) => void) | undefined;
 	resolveHost?: ((globalTarget: GlobalTarget) => ClaudeBridgeAccountHostV1 | undefined) | undefined;
+	/** Explicit config path for wizard writes/refreshes; wins over `env`. */
+	configPath?: string | undefined;
+	env?: NodeJS.ProcessEnv | undefined;
+	/** Defaults to the real `claude auth login` driver; tests inject a fake. */
+	startLogin?: StartLogin | undefined;
+	/** Copies the existing config aside before a wizard overwrite; tests inject. */
+	backupConfigFile?: ((path: string) => void) | undefined;
 }
 
 export type RotatorCommandHandler = (args: string, ctx: RotatorCommandContext) => Promise<void>;
@@ -58,6 +101,8 @@ export function createRotatorCommandHandler(options: RotatorCommandOptions): Rot
 	const now = options.now ?? (() => Date.now());
 	const mkdirRecursive = options.mkdirRecursive ?? ((path: string) => mkdirSync(path, { recursive: true, mode: 0o700 }));
 	const resolveHost = options.resolveHost ?? resolveBridgeAccountHost;
+	const startLogin = options.startLogin ?? startClaudeLogin;
+	const backupConfigFile = options.backupConfigFile ?? ((path: string) => copyFileSync(path, `${path}.bak`));
 
 	return async (args, ctx) => {
 		const parsed = parseArgs(args);
@@ -67,7 +112,15 @@ export function createRotatorCommandHandler(options: RotatorCommandOptions): Rot
 				runStatus(options.state, ctx, { globalTarget, now, resolveHost });
 				return;
 			case "login":
-				runLogin(options.state, ctx, parsed.argument, { mkdirRecursive });
+				await runLogin(options.state, ctx, parsed.argument, {
+					mkdirRecursive,
+					globalTarget,
+					resolveHost,
+					startLogin,
+					backupConfigFile,
+					configPath: options.configPath,
+					env: options.env,
+				});
 				return;
 			case "reset":
 				runReset(options.state, ctx, parsed.argument);
@@ -131,9 +184,80 @@ function runStatus(state: RotatorCommandState, ctx: RotatorCommandContext, deps:
 
 interface LoginDeps {
 	mkdirRecursive: (path: string) => void;
+	globalTarget: GlobalTarget;
+	resolveHost: (globalTarget: GlobalTarget) => ClaudeBridgeAccountHostV1 | undefined;
+	startLogin: StartLogin;
+	backupConfigFile: (path: string) => void;
+	configPath?: string | undefined;
+	env?: NodeJS.ProcessEnv | undefined;
 }
 
-function runLogin(
+/** Non-optional dialog functions, narrowed after feature detection. */
+interface DialogFns {
+	select: (title: string, options: string[], opts?: RotatorDialogOptions) => Promise<string | undefined>;
+	confirm: (title: string, message: string, opts?: RotatorDialogOptions) => Promise<boolean>;
+	input: (title: string, placeholder?: string, opts?: RotatorDialogOptions) => Promise<string | undefined>;
+}
+
+const ADD_ACCOUNT_OPTION = "Add a new account…";
+
+/** `/claude-accounts login`: interactive wizard when pi exposes dialogs, else
+ *  the guidance flow that prints the exact `claude auth login` command. */
+async function runLogin(
+	state: RotatorCommandState,
+	ctx: RotatorCommandContext,
+	argument: string,
+	deps: LoginDeps,
+): Promise<void> {
+	const { select, confirm, input } = ctx.ui;
+	if (typeof select !== "function" || typeof confirm !== "function" || typeof input !== "function") {
+		runLoginGuidance(state, ctx, argument, deps);
+		return;
+	}
+	const dialogs: DialogFns = { select, confirm, input };
+
+	const profiles = state.config?.profiles ?? [];
+
+	if (argument.length > 0) {
+		const match = findProfile(profiles, argument);
+		if (match !== undefined) {
+			await runProfileLogin(state, ctx, match, profiles, false, deps, dialogs);
+			return;
+		}
+		const create = await dialogs.confirm(
+			"Create new account?",
+			`No profile matches "${argument}" — add it to the rotator?`,
+		);
+		if (create !== true) {
+			ctx.ui.notify(`pi-claude-bridge-rotator: no account added for "${argument}".`, "info");
+			return;
+		}
+		const created = buildWizardProfile(argument, profiles, deps.env);
+		await runProfileLogin(state, ctx, created, [...profiles, created], true, deps, dialogs);
+		return;
+	}
+
+	if (profiles.length > 0) {
+		const options = [...profiles.map((profile) => profile.label), ADD_ACCOUNT_OPTION];
+		const choice = await dialogs.select("Log in to which account?", options);
+		if (choice === undefined) {
+			ctx.ui.notify("pi-claude-bridge-rotator: login cancelled.", "info");
+			return;
+		}
+		const index = options.indexOf(choice);
+		const match = index >= 0 && index < profiles.length ? profiles[index] : undefined;
+		if (match !== undefined && choice !== ADD_ACCOUNT_OPTION) {
+			await runProfileLogin(state, ctx, match, profiles, false, deps, dialogs);
+			return;
+		}
+		// Choosing the add option (or an unknown value) falls through to the loop.
+	}
+
+	await runAddFlow(state, ctx, deps, dialogs);
+}
+
+/** Build the login command guidance for the no-dialog fallback. */
+function runLoginGuidance(
 	state: RotatorCommandState,
 	ctx: RotatorCommandContext,
 	argument: string,
@@ -141,20 +265,177 @@ function runLogin(
 ): void {
 	const config = requireConfig(state, ctx);
 	if (config === undefined) return;
-	const targets = selectProfiles(config, argument, ctx);
+	const targets = argument.length > 0 ? selectProfiles(config, argument, ctx) : [...config.profiles];
 	if (targets === undefined) return;
 
 	const lines: string[] = [`Prepared ${targets.length} login command(s) for the rotator profiles:`];
 	for (const profile of targets) {
 		try {
 			deps.mkdirRecursive(profile.configDir);
-			lines.push(`CLAUDE_CONFIG_DIR=${profile.configDir} claude login`);
+			lines.push(`CLAUDE_CONFIG_DIR=${profile.configDir} claude auth login --claudeai`);
 		} catch (error) {
 			lines.push(`# could not create ${profile.configDir}: ${describeError(error)}`);
 		}
 	}
 	lines.push("Run each command in another terminal, then /claude-accounts probe to refresh identity.");
 	ctx.ui.notify(lines.join("\n"), "info");
+}
+
+/** Add-account loop: label → create → log in → optionally repeat. */
+async function runAddFlow(
+	state: RotatorCommandState,
+	ctx: RotatorCommandContext,
+	deps: LoginDeps,
+	dialogs: DialogFns,
+): Promise<void> {
+	let profiles = [...(state.config?.profiles ?? [])];
+	for (;;) {
+		const label = await dialogs.input("Account label", "e.g. Personal");
+		if (label === undefined) {
+			ctx.ui.notify("pi-claude-bridge-rotator: login cancelled.", "info");
+			return;
+		}
+		const created = buildWizardProfile(label, profiles, deps.env);
+		profiles = [...profiles, created];
+		await runProfileLogin(state, ctx, created, profiles, true, deps, dialogs);
+		const again = await dialogs.confirm("Add another account?", "Set up another Claude account now?");
+		if (again !== true) return;
+	}
+}
+
+/** Authenticate one profile: create its config dir, persist a new profile,
+ *  drive the OAuth child, and record the identity when the bridge can probe. */
+async function runProfileLogin(
+	state: RotatorCommandState,
+	ctx: RotatorCommandContext,
+	profile: RotatorProfileConfig,
+	profiles: readonly RotatorProfileConfig[],
+	isNew: boolean,
+	deps: LoginDeps,
+	dialogs: DialogFns,
+): Promise<void> {
+	try {
+		deps.mkdirRecursive(profile.configDir);
+	} catch (error) {
+		ctx.ui.notify(
+			`pi-claude-bridge-rotator: could not create ${profile.configDir}: ${describeError(error)}`,
+			"error",
+		);
+		return;
+	}
+
+	if (isNew) {
+		const policy = state.config?.policy ?? DEFAULT_POLICY;
+		const configPath = resolveConfigPath({ configPath: deps.configPath, env: deps.env });
+		// The config could not be loaded but the file exists: it is about to be
+		// replaced by the wizard's write. Preserve the original bytes first so a
+		// typo-broken hand edit is recoverable. A failed backup must never block
+		// the recovery write, so it degrades to a warning.
+		if (state.config === undefined && existsSync(configPath)) {
+			try {
+				deps.backupConfigFile(configPath);
+			} catch (error) {
+				ctx.ui.notify(
+					`pi-claude-bridge-rotator: could not back up the existing config at ${configPath} `
+						+ `(${describeError(error)}); continuing.`,
+					"warning",
+				);
+			}
+		}
+		try {
+			saveConfig({ policy, profiles }, { configPath: deps.configPath, env: deps.env });
+		} catch (error) {
+			ctx.ui.notify(`pi-claude-bridge-rotator: could not write the config: ${describeError(error)}`, "error");
+			return;
+		}
+		state.refresh?.();
+	}
+
+	let handle: ClaudeLoginHandle;
+	try {
+		handle = await deps.startLogin({ configDir: profile.configDir });
+	} catch (error) {
+		ctx.ui.notify(`pi-claude-bridge-rotator: could not start claude auth login: ${describeError(error)}`, "error");
+		return;
+	}
+
+	ctx.ui.notify(`Opening browser to sign in…\n${handle.url}`, "info");
+
+	const code = await dialogs.input("Paste the login code", "code shown in the browser after authorizing");
+	if (code === undefined) {
+		handle.cancel();
+		ctx.ui.notify("pi-claude-bridge-rotator: login cancelled.", "info");
+		return;
+	}
+
+	const result = await handle.submitCode(code);
+	if (!result.ok) {
+		ctx.ui.notify(
+			`pi-claude-bridge-rotator: login for ${profile.label} (${profile.id}) failed.\n${result.output}`,
+			"error",
+		);
+		return;
+	}
+
+	const identity = await probeIdentity(state, ctx, profile, deps);
+	const shown = identity !== undefined ? formatIdentity(identity) : undefined;
+	const suffix = shown !== undefined && shown !== "unknown" ? ` — ${shown}` : "";
+	ctx.ui.notify(`pi-claude-bridge-rotator: logged in ${profile.label} (${profile.id})${suffix}.`, "info");
+}
+
+/** Probe the freshly authenticated profile through the bridge host. A probe
+ *  failure (or a missing host) must never turn a successful login into an
+ *  error message, so every failure degrades to `undefined`. */
+async function probeIdentity(
+	state: RotatorCommandState,
+	ctx: RotatorCommandContext,
+	profile: RotatorProfileConfig,
+	deps: LoginDeps,
+): Promise<ClaudeAccountIdentity | undefined> {
+	const host = deps.resolveHost(deps.globalTarget);
+	if (host === undefined) return undefined;
+	const cwd = ctx.cwd !== undefined && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
+	try {
+		const result = await host.probeProfile({
+			profile: { profileId: profile.id, label: profile.label, configDir: profile.configDir },
+			cwd,
+		});
+		const identity = result.identity;
+		if (identity === undefined || !hasIdentity(identity)) return undefined;
+		const record = toIdentity(identity);
+		state.router?.recordIdentity(profile.id, record);
+		return record;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Derive a wizard profile: slugged unique id, the trimmed label, and an
+ *  absolute config dir under `~/.claude-rotator/<id>`. */
+function buildWizardProfile(
+	label: string,
+	existing: readonly RotatorProfileConfig[],
+	env: NodeJS.ProcessEnv | undefined,
+): RotatorProfileConfig {
+	const trimmed = label.trim();
+	const id = uniqueProfileId(existing.map((profile) => profile.id), slugifyProfileId(trimmed));
+	return {
+		id,
+		label: trimmed.length > 0 ? trimmed : id,
+		configDir: join(rotatorProfilesBaseDir(env), id),
+	};
+}
+
+/** Exact/first, then case-insensitive match on id or label. */
+function findProfile(
+	profiles: readonly RotatorProfileConfig[],
+	argument: string,
+): RotatorProfileConfig | undefined {
+	const needle = argument.toLowerCase();
+	return profiles.find((profile) => profile.id === argument)
+		?? profiles.find((profile) => profile.label === argument)
+		?? profiles.find((profile) => profile.id.toLowerCase() === needle)
+		?? profiles.find((profile) => profile.label.toLowerCase() === needle);
 }
 
 function runReset(state: RotatorCommandState, ctx: RotatorCommandContext, argument: string): void {
@@ -271,11 +552,7 @@ function selectProfiles(
 	ctx: RotatorCommandContext,
 ): RotatorProfileConfig[] | undefined {
 	if (argument.length === 0) return [...config.profiles];
-	const needle = argument.toLowerCase();
-	const match = config.profiles.find((profile) => profile.id === argument)
-		?? config.profiles.find((profile) => profile.label === argument)
-		?? config.profiles.find((profile) => profile.id.toLowerCase() === needle)
-		?? config.profiles.find((profile) => profile.label.toLowerCase() === needle);
+	const match = findProfile(config.profiles, argument);
 	if (match === undefined) {
 		const available = config.profiles.map((profile) => `${profile.label} (${profile.id})`).join(", ");
 		ctx.ui.notify(
@@ -301,7 +578,11 @@ function formatDuration(ms: number): string {
 	return rest === 0 ? `${hours}h` : `${hours}h${rest}m`;
 }
 
-function formatIdentity(identity: ProfileIdentity): string {
+function formatIdentity(identity: {
+	email?: string | undefined;
+	organization?: string | undefined;
+	subscriptionType?: string | undefined;
+}): string {
 	const parts: string[] = [];
 	if (identity.email !== undefined) parts.push(identity.email);
 	if (identity.organization !== undefined) parts.push(identity.organization);

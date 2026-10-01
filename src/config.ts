@@ -10,9 +10,10 @@
 // `configDir` is tilde-expanded to an absolute path here: the bridge hands the
 // value straight to the child as `CLAUDE_CONFIG_DIR` and never expands `~`.
 
-import { readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 export const ROTATOR_CONFIG_FILENAME = "claude-bridge-rotator.json";
 
@@ -61,6 +62,13 @@ export function defaultConfigPath(env: NodeJS.ProcessEnv = process.env): string 
 	return join(piAgentDir(env), ROTATOR_CONFIG_FILENAME);
 }
 
+/** Absolute config file path, resolved exactly the way `loadConfig` and
+ *  `saveConfig` resolve it: explicit `configPath`, else the env/default agent
+ *  dir. Exported so the command can inspect/back up the very file it writes. */
+export function resolveConfigPath(options: ConfigLoadOptions = {}): string {
+	return resolve(options.configPath ?? defaultConfigPath(options.env));
+}
+
 /** Expand a leading `~` to `home` and force an absolute result. A literal `~`
  *  left in `configDir` would make the child create a directory named "~". */
 export function expandHomePath(input: string, home: string = homedir()): string {
@@ -93,8 +101,7 @@ function optionalNonEmptyString(value: unknown): string | undefined {
 }
 
 export function loadConfig(options: ConfigLoadOptions = {}): RotatorConfig {
-	const env = options.env ?? process.env;
-	const path = resolve(options.configPath ?? defaultConfigPath(env));
+	const path = resolveConfigPath(options);
 
 	let raw: string;
 	try {
@@ -154,4 +161,73 @@ function parsePolicy(value: unknown, path: string): RotatorPolicy {
 		`Rotator config at ${path}: unsupported policy ${JSON.stringify(value)}; `
 			+ `v1 supports: ${SUPPORTED_POLICIES.join(", ")}.`,
 	);
+}
+
+// --- Wizard write support ---------------------------------------------------
+
+/** Turn a human label into a stable, filesystem-safe profile id: lowercase,
+ *  non-alphanumeric runs become `-`, leading/trailing dashes trimmed. An empty
+ *  result (labels like "!!!") falls back to `account` so an id always exists. */
+export function slugifyProfileId(label: string): string {
+	const collapsed = label
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.replace(/-+/g, "-");
+	return collapsed.length > 0 ? collapsed : "account";
+}
+
+/** First free id: `base`, else `base-2`, `base-3`, … over the existing ids. */
+export function uniqueProfileId(existing: readonly string[], base: string): string {
+	const taken = new Set(existing);
+	if (!taken.has(base)) return base;
+	let suffix = 2;
+	while (taken.has(`${base}-${suffix}`)) suffix += 1;
+	return `${base}-${suffix}`;
+}
+
+/** Base directory for wizard-created profile config dirs: `~/.claude-rotator`.
+ *  `env` is accepted for symmetry with the other path helpers; the base is
+ *  deliberately home-relative so accounts survive a changing agent dir. */
+export function rotatorProfilesBaseDir(_env: NodeJS.ProcessEnv = process.env): string {
+	return join(homedir(), ".claude-rotator");
+}
+
+export interface SaveConfigOptions {
+	/** Explicit config file path; wins over `env`. */
+	configPath?: string | undefined;
+	env?: NodeJS.ProcessEnv | undefined;
+}
+
+export interface SaveConfigInput {
+	policy: RotatorPolicy;
+	profiles: readonly RotatorProfileConfig[];
+}
+
+/** Write the config atomically (sibling temp file + rename, explicit 0600),
+ *  creating the agent directory when needed. The output always roundtrips
+ *  through `loadConfig`. Returns the absolute path written. */
+export function saveConfig(config: SaveConfigInput, options: SaveConfigOptions = {}): string {
+	const path = resolveConfigPath(options);
+	const directory = dirname(path);
+	mkdirSync(directory, { recursive: true, mode: 0o700 });
+	const tempPath = join(
+		directory,
+		`.${ROTATOR_CONFIG_FILENAME}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
+	);
+	const payload = `${JSON.stringify({ policy: config.policy, profiles: config.profiles }, null, "\t")}\n`;
+	try {
+		// The write mode is still subject to umask, so chmod after the rename.
+		writeFileSync(tempPath, payload, { encoding: "utf8", mode: 0o600 });
+		renameSync(tempPath, path);
+		chmodSync(path, 0o600);
+	} catch (error) {
+		try {
+			unlinkSync(tempPath);
+		} catch {
+			// Best effort: the temp file may never have been created.
+		}
+		throw error;
+	}
+	return path;
 }

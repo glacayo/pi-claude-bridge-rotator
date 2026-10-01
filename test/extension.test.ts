@@ -3,7 +3,7 @@
 // `pi` object with a temp agent dir, so nothing touches the real environment.
 
 import { afterEach, describe, expect, it } from "vitest";
-import { writeFileSync } from "node:fs";
+import { unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { cleanupTempDirs, makeTempDir, profile } from "./helpers.js";
@@ -11,8 +11,15 @@ import type { RotatorConfig } from "../src/config.js";
 import { createRouter, CLAUDE_ACCOUNT_ROUTER_SYMBOL } from "../src/router.js";
 import { CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL, resolveBridgeAccountHost } from "../src/host.js";
 import type { GlobalTarget } from "../src/host.js";
+import type { RotatorCommandState } from "../src/commands.js";
 import { activateExtension, RouterPublisher } from "../src/index.js";
 import activate, { createRotatorCommandHandler } from "../src/index.js";
+
+const COMMAND_STATE_SYMBOL = Symbol.for("pi-claude-bridge-rotator:commandState");
+
+function commandState(target: GlobalTarget): RotatorCommandState {
+	return target[COMMAND_STATE_SYMBOL] as RotatorCommandState;
+}
 
 afterEach(() => {
 	cleanupTempDirs();
@@ -236,5 +243,66 @@ describe("activateExtension wiring", () => {
 		expect(registered).toEqual(["claude-accounts"]);
 		expect(target[CLAUDE_ACCOUNT_ROUTER_SYMBOL]).toBeDefined();
 		expect(typeof createRotatorCommandHandler).toBe("function");
+	});
+});
+
+describe("refresh hook", () => {
+	it("rebuilds and republishes the router with the new config", () => {
+		const { pi } = makeFakePi();
+		const target: GlobalTarget = {};
+		const agent = makeAgentDir(true);
+		activateExtension(pi, { globalTarget: target, env: agent.env });
+		const first = target[CLAUDE_ACCOUNT_ROUTER_SYMBOL];
+		const state = commandState(target);
+
+		writeFileSync(
+			agent.config.path,
+			JSON.stringify({
+				policy: "balanced",
+				profiles: [
+					profile("a", { configDir: join(agent.dir, "acc-a") }),
+					profile("b", { configDir: join(agent.dir, "acc-b") }),
+					profile("c", { configDir: join(agent.dir, "acc-c") }),
+				],
+			}),
+			"utf8",
+		);
+
+		state.refresh?.();
+
+		expect(target[CLAUDE_ACCOUNT_ROUTER_SYMBOL]).not.toBe(first);
+		expect(state.config?.profiles.map((entry) => entry.id)).toEqual(["a", "b", "c"]);
+		expect(state.configError).toBeUndefined();
+	});
+
+	it("stores the first activation's publisher once", () => {
+		const { pi } = makeFakePi();
+		const target: GlobalTarget = {};
+		const agent = makeAgentDir(true);
+
+		activateExtension(pi, { globalTarget: target, env: agent.env });
+		const state = commandState(target);
+		const firstPublisher = state.publisher;
+		expect(firstPublisher).toBeDefined();
+
+		activateExtension(pi, { globalTarget: target, env: agent.env });
+
+		expect(commandState(target).publisher).toBe(firstPublisher);
+	});
+
+	it("keeps the previous router published when the refresh fails", () => {
+		const { pi } = makeFakePi();
+		const target: GlobalTarget = {};
+		const agent = makeAgentDir(true);
+		activateExtension(pi, { globalTarget: target, env: agent.env });
+		const first = target[CLAUDE_ACCOUNT_ROUTER_SYMBOL];
+		const state = commandState(target);
+
+		unlinkSync(agent.config.path);
+		state.refresh?.();
+
+		expect(target[CLAUDE_ACCOUNT_ROUTER_SYMBOL]).toBe(first);
+		expect(state.configError).toBeDefined();
+		expect(state.config).toBeUndefined();
 	});
 });
