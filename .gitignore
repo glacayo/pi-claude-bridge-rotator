@@ -1,6 +1,9 @@
 # Local Pi runtime state
 .atl/
 
+# Local CodeGraph index
+.codegraph/
+
 # Dependencies
 node_modules/
 
