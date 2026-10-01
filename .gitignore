@@ -1,2 +1,14 @@
 # Local Pi runtime state
 .atl/
+
+# Dependencies
+node_modules/
+
+# Build and test artifacts
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local runtime state (never committed)
+claude-bridge-rotator.json
+claude-bridge-rotator-state.json

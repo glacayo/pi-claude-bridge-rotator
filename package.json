@@ -1,0 +1,37 @@
+{
+  "name": "pi-claude-bridge-rotator",
+  "version": "0.1.0",
+  "description": "Rotates multiple Claude Pro subscription accounts for @vanillagreen/pi-claude-bridge.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "claude",
+    "claude-code",
+    "claude-pro",
+    "account-rotation"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}
