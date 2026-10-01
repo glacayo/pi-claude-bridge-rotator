@@ -19,6 +19,16 @@ Zero modifications to the bridge — the contract is the designed extension poin
   `feat/claude-bridge-rotator` (parent `~/localhost` repo left untouched).
 - **Contract authority**: `~/.pi/agent/npm/node_modules/@vanillagreen/pi-claude-bridge/src/account-router.ts`.
   Never mutate the contract; local type mirror only, no runtime import of bridge code.
+- **Login wizard (added 2026-10-01, user-requested)**: setup is ENTIRELY command-driven —
+  `/claude-accounts login` asks for account labels in native pi dialogs, auto-creates
+  configDirs under `~/.claude-rotator/<id>`, writes the config file itself, and drives
+  `claude auth login --claudeai` as a piped child (browser opens automatically; the OAuth
+  code is pasted into a pi `input` dialog and forwarded on stdin). Zero manual file
+  editing, zero separate terminals. Hand-edited config remains supported as an
+  advanced path. Config mutations from the command republish the router immediately
+  (owner-republish; no `/reload` needed). Non-TUI modes with no dialog UI fall back to
+  the previous guidance flow (print the exact `CLAUDE_CONFIG_DIR=… claude auth login`
+  command).
 
 ## Architecture
 
@@ -69,7 +79,8 @@ Zero modifications to the bridge — the contract is the designed extension poin
 - [x] 4. Extension entry: symbol publish/cleanup + bridge-absent warning
 - [x] 5. Commands `/claude-accounts status|login|reset|probe`
 - [x] 6. README + local `pi install` verification + smoke test
-- [ ] 7. User: login both accounts + live rotation verification (user-managed)
+- [ ] 8. Interactive login wizard: `/claude-accounts login` does ALL setup (inserted by user request 2026-10-01; runs BEFORE task 7, which will use its result)
+- [ ] 7. User: login both accounts + live rotation verification (user-managed, via the wizard)
 
 ## Evidence
 
@@ -81,7 +92,8 @@ Zero modifications to the bridge — the contract is the designed extension poin
 | 4 | 683799d | tsc clean; vitest 103/103; independent verifier Pass (9/9 confirm, zero defects); native review approved + burned (lineage `review-894c5c8aa9bca5a6`) |
 | 5 | 683799d | 23 command tests + 11 extension tests; command registration + ownership covered; same verifier/review as task 4 (one work-unit commit for Unit 2) |
 | 6 | 7498322 + docs commit | `pi install .` → `pi list` shows package; SDK smoke: router PUBLISHED (contract callable, `resolveProfile` returns exact configDir), bridge account host coexists; temp smoke config removed (dormant until task 7) |
-| 7 | (pending) | user confirms live rotation |
+| 8 | (pending) | delegated writer Unit 3; tsc clean + vitest green; verifier; native review |
+| 7 | (pending) | user confirms live rotation via the wizard |
 
 ## Resume instructions (for the next Pi session in this repo)
 
@@ -113,8 +125,9 @@ Full finding text lives in the native review store (`.git/gentle-ai/review-trans
 4. ~~Re-read bridge extension mechanics~~ DONE — facts recorded in "Extension API facts" under Learnings and verified in review.
 5. ~~Delegate tasks 4–5 as ONE `gentle-ai-worker` run (Unit 2)~~ DONE — commit `683799d`, verifier 9/9, native review approved + burned.
 6. ~~Task 6 — README + pi install + smoke~~ DONE (2026-10-01, same session).
-7. FINAL, user-managed (task 7): user creates `${PI_CODING_AGENT_DIR:-~/.pi/agent}/claude-bridge-rotator.json` with their two real profiles (README has the exact shape), runs the `CLAUDE_CONFIG_DIR=… claude login` commands that `/claude-accounts login` prints (or from the README), `/reload`s, and verifies live rotation: `/claude-accounts status` shows both profiles + identities (probe), fresh pi sessions alternate profiles, and a rate limit moves traffic to the other account.
-8. Optional later: advisory findings (Unit 1: R3-001…007; Unit 2: R3-login-unquoted-path, R3-probe-no-deadline, R3-state-publisher-divergence) — separate non-blocking work.
+7. NEXT (task 8, delegated writer Unit 3): interactive login wizard per the decision block — new `src/login.ts` driver, config auto-write (`slugifyProfileId`, `uniqueProfileId`, atomic 0600 save), `state.refresh` republish hook in `src/index.ts`, wizard `runLogin` with `ui.select/confirm/input` + no-dialog fallback to the guidance flow, README login section rewritten (`claude auth login` naming fix). Allowed surfaces: src/login.ts, src/commands.ts, src/config.ts, src/index.ts, test/login.test.ts, test/commands.test.ts, test/config.test.ts, test/extension.test.ts, README.md. After the worker: parent tsc/vitest + read-through, work-unit commit, assess → verifier, native review, bookkeeping.
+8. THEN, user-managed (task 7, now wizard-based): user runs `/claude-accounts login`, follows the dialogs (browser opens, paste code), adds both accounts, and verifies live rotation: `/claude-accounts status` shows both profiles + identities, fresh pi sessions alternate profiles, and a rate limit moves traffic to the other account. NO manual config editing is involved anymore.
+9. Optional later: advisory findings (Unit 1: R3-001…007; Unit 2: R3-login-unquoted-path, R3-probe-no-deadline, R3-state-publisher-divergence) — separate non-blocking work.
 
 ## Learnings so far
 
@@ -181,3 +194,24 @@ Full finding text lives in the native review store (`.git/gentle-ai/review-trans
 - Dormant-by-default: with NO config file the extension registers `/claude-accounts`
   but publishes nothing — a safe resting state; deleting the config deactivates routing
   without uninstalling.
+
+### Login wizard research facts (recorded 2026-10-01, pre-Unit-3)
+
+- pi command handlers get the FULL dialog API: `ExtensionUIContext` = `select(title,
+  options, opts?) → Promise<string|undefined>`, `confirm(title, message, opts?) →
+  Promise<boolean>`, `input(title, placeholder?, opts?) → Promise<string|undefined>`,
+  plus `notify`. Interactive/RPC modes implement them; JSON/print have no UI — guard
+  with `typeof ctx.ui.input === "function"` before wizarding and fall back to guidance.
+- `claude login` DOES NOT EXIST as a top-level subcommand — the correct command is
+  `claude auth login [--claudeai|--console|--email <email>|--sso]`. (The pre-wizard
+  README wrongly said `claude login`; fixed in the wizard unit.)
+- `claude auth login --claudeai` verified HEADLESS-safe: with piped stdio it prints
+  `Opening browser to sign in…` + the authorize URL (browser opens via the child,
+  independent of stdio), then waits at `Paste code here if prompted >` reading a line
+  from stdin. So an extension can spawn it, relay the URL via notify, collect the code
+  in a pi `input` dialog, and forward it on the child's stdin — the complete OAuth
+  flow without a terminal handover.
+- `BROWSER=/bin/true` suppresses the browser open in tests; the URL still prints.
+- `RouterPublisher.publish` already supports owner-republish (replaces its own value),
+  so config mutations can refresh the live router without `/reload`; a stale process
+  that lost ownership keeps the old router (bounded, accepted).
