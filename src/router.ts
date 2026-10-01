@@ -15,7 +15,8 @@
 
 import type { RotatorConfig, RotatorProfileConfig } from "./config.js";
 import { cloneJsonValue, MAX_SESSION_AFFINITY_ENTRIES, RotatorStateStore, touchSessionAffinity } from "./state.js";
-import type { JsonValue } from "./state.js";
+import type { JsonValue, ProfileUsageError, ProfileUsageRecord } from "./state.js";
+import type { UsageFetchResult } from "./usage.js";
 
 /** The bridge's published contract symbol (see contract authority above). */
 export const CLAUDE_ACCOUNT_ROUTER_SYMBOL = Symbol.for("kendex.pi.claude-account-router.v1");
@@ -271,6 +272,37 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 				state.identity[profileId] = { ...state.identity[profileId], usage: cloned, updatedAtMs: this.now() };
 			});
 		});
+	}
+
+	/** Store the outcome of one plan-usage poll.
+	 *
+	 *  Not part of the bridge contract: usage-aware routing (a later stage) reads
+	 *  it through `planUsage`. On success the snapshot replaces the previous one
+	 *  and the error is cleared; on failure the previous snapshot is kept and the
+	 *  typed reason is recorded, so status can still show last known values.
+	 *  Guarded like the other telemetry methods and a no-op for unknown ids. */
+	recordPlanUsage(profileId: string, result: UsageFetchResult): void {
+		this.guard("recordPlanUsage", undefined, () => {
+			if (!this.profiles.has(profileId)) return;
+			const atMs = this.now();
+			this.state.update((state) => {
+				const previous = state.usage[profileId]?.snapshot;
+				if (result.ok) {
+					state.usage[profileId] = { snapshot: result.snapshot };
+					return;
+				}
+				const lastError: ProfileUsageError = { reason: result.reason, atMs };
+				if (result.httpStatus !== undefined) lastError.httpStatus = result.httpStatus;
+				const record: ProfileUsageRecord = { lastError };
+				if (previous !== undefined) record.snapshot = previous;
+				state.usage[profileId] = record;
+			});
+		});
+	}
+
+	/** Read the stored plan-usage record for a profile (never throws). */
+	planUsage(profileId: string): ProfileUsageRecord | undefined {
+		return this.guard("planUsage", undefined, () => this.state.state.usage[profileId]);
 	}
 
 	current(_modelId: string, sessionId?: string): ClaudeAccountRoute | undefined {
