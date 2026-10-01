@@ -154,7 +154,7 @@ prompt-cache loss.
 
 | Task | Commit | Checks |
 |---|---|---|
-| 0 | ci commit after the doc commit | SHAs resolved from `git ls-remote` (`v4` = `v4.4.0` for both); zizmor delta clean; CI run proven on the first stage PR |
+| 0 | c1e6654 (+ docs f7e12b2, 182f054; chore 0853144) | SHAs resolved from `git ls-remote` (`v4` = `v4.4.0` for both); zizmor delta clean; tsc clean; vitest 134/134; assess `high` (`shell_source` in `ci.yml`) → independent verifier PASS 6/6; native review folded into the task 1 review (base `217d59d`, so these bytes are reviewed with it); CI run proven on the first stage PR |
 | 1 | (pending) | |
 | 2 | (pending) | |
 | 3 | (pending) | |
@@ -165,4 +165,6 @@ prompt-cache loss.
 - 2026-10-01: branch `feat/usage-aware-routing` created from `main` at
   `217d59d` (PR #1 merged). Exploration done, design recorded.
 - Chain strategy chosen (`feature-branch-chain`); task 0 done.
+- Review boundary: last reviewed = `217d59d` (main). Task 0 is reviewed together
+  with task 1 (one 4-lens cycle instead of a separate one for 3 YAML lines).
 - Next: task 1 on branch `feat/usage-status` (delegated writer).
