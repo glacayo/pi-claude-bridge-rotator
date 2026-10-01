@@ -10,19 +10,50 @@ cools down while traffic moves to another, and accounts that need a re-login are
 taken out of rotation until an operator resets them. The bridge itself is never
 modified.
 
-## Configuration
+## Requirements
+
+- [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) with
+  extension support (peer `>=0.86.0`; developed and verified against `0.99.1`).
+- `@vanillagreen/pi-claude-bridge` — the consumer of the router. Without it the
+  rotator loads and reports status, but nothing routes through it.
+
+## Install
+
+```sh
+pi install pi-claude-bridge-rotator   # once published to npm
+pi install /path/to/pi-claude-bridge-rotator   # local checkout
+```
+
+Then `/reload` (or start a new pi session). The extension publishes its router
+at load when a valid configuration exists; with no configuration it stays
+dormant and `/claude-accounts status` explains what is missing.
+
+## Configure
 
 The rotator reads `${PI_CODING_AGENT_DIR:-~/.pi/agent}/claude-bridge-rotator.json`:
 
 ```json
 {
-  "policy": "balanced",
-  "profiles": [{ "id": "primary", "label": "Primary", "configDir": "~/.claude-primary" }]
+	"policy": "balanced",
+	"profiles": [
+		{ "id": "primary", "label": "Primary", "configDir": "~/.claude-primary" },
+		{ "id": "secondary", "label": "Secondary", "configDir": "~/.claude-secondary" }
+	]
 }
 ```
 
-`configDir` is the Claude config dir (`CLAUDE_CONFIG_DIR`) for that account and
-is tilde-expanded to an absolute path.
+- `id` — stable unique identifier (persisted by the bridge across sessions;
+  keep it stable or affinity is lost).
+- `label` — display name.
+- `configDir` — the Claude config dir (`CLAUDE_CONFIG_DIR`) for that account,
+  tilde-expanded to an absolute path at load time.
+
+Authenticate each account once with the command printed by
+`/claude-accounts login` (run it in a separate terminal):
+
+```sh
+CLAUDE_CONFIG_DIR=/home/you/.claude-primary claude login
+```
 
 ## Commands
 
@@ -38,7 +69,43 @@ All management goes through a single `/claude-accounts` command:
 
 `[profile]` accepts a profile id or label; omitting it targets every profile.
 
-> **Work in progress.** This package is under active development: the router
-> core, extension registration, and management commands are implemented, while
-> the full documentation is still pending. Do not install it for production use
-> yet.
+## How rotation works
+
+- **Balanced by session**: every new session is routed round-robin over the
+  eligible profiles; within a session, requests stick to its profile so Claude
+  Code `--resume` keeps working (the bridge needs the exact `configDir`).
+- **Cooldowns**: a rate-limited account stops receiving traffic until the
+  upstream reset time (or a 30-minute default when the payload carries no
+  reset); all traffic goes to the remaining account(s). The bridge's retry loop
+  re-asks the router on failures, so cooldowns apply immediately.
+- **Invalid accounts**: an auth or billing failure marks the profile invalid —
+  it leaves rotation until you re-login and run `/claude-accounts reset`.
+- When every account is cooling or invalid, the router throws with the earliest
+  reset time, which the bridge surfaces as a clear error.
+
+State lives in `~/.pi/agent/claude-bridge-rotator-state.json` (0600, atomic
+writes): cooldowns, invalid set, session affinity (pruned to the last 200
+sessions), and a cached identity per profile for display.
+
+## Troubleshooting
+
+- **"no @vanillagreen/pi-claude-bridge account host found"** — the bridge is
+  not installed or disabled; the rotator's router is published but nothing
+  consumes it.
+- **`status` shows a config error** — fix the JSON; the next `/reload`
+  republishes.
+- **`probe` reports no identity** — the account is not logged in, or the
+  bridge's 10s probe deadline hit an empty response; run `login` first.
+- **Every account unavailable** — wait for the reset time in the error, or
+  `reset` after a re-login.
+- **Disable routing without uninstalling** — remove or rename the
+  configuration file and `/reload`.
+
+## Non-goals (v1)
+
+Model-scoped quota rotation (`route.modelId`), quota-aware probing for
+selection, auto-detection of profiles, and multi-policy runtime switching.
+
+## License
+
+[MIT](LICENSE)
