@@ -66,8 +66,8 @@ Zero modifications to the bridge — the contract is the designed extension poin
 - [x] 1. Scaffold package (package.json with `pi` manifest, tsconfig, vitest, MIT LICENSE)
 - [x] 2. Config + state modules with unit tests
 - [x] 3. Router core `ClaudeAccountRouterV1` with TDD tests
-- [ ] 4. Extension entry: symbol publish/cleanup + bridge-absent warning
-- [ ] 5. Commands `/claude-accounts status|login|reset|probe`
+- [x] 4. Extension entry: symbol publish/cleanup + bridge-absent warning
+- [x] 5. Commands `/claude-accounts status|login|reset|probe`
 - [ ] 6. README + local `pi install` verification + smoke test
 - [ ] 7. User: login both accounts + live rotation verification (user-managed)
 
@@ -78,14 +78,21 @@ Zero modifications to the bridge — the contract is the designed extension poin
 | 1 | c009b1e | `npx tsc --noEmit` clean; pi manifest + engines >=22; lock consistent |
 | 2 | 6c58b41 | config 16 + state 10 tests pass (26); tsc clean |
 | 3 | a77a53c + a0bed41 | 69/69 tests pass, tsc clean; independent verifier Pass (minor cooldown-invariant defect found, fixed in a0bed41, re-verified Pass) |
-| 4 | (pending) | vitest pass, manual load check |
-| 5 | (pending) | vitest pass, command registration check |
+| 4 | 683799d | tsc clean; vitest 103/103; independent verifier Pass (9/9 confirm, zero defects); native review approved + burned (lineage `review-894c5c8aa9bca5a6`) |
+| 5 | 683799d | 23 command tests + 11 extension tests; command registration + ownership covered; same verifier/review as task 4 (one work-unit commit for Unit 2) |
 | 6 | (pending) | pi list shows package, symbol resolution smoke |
 | 7 | (pending) | user confirms live rotation |
 
 ## Resume instructions (for the next Pi session in this repo)
 
-Status at handoff: branch `feat/claude-bridge-rotator`; work-tree clean; HEAD `a0bed41`. Tasks 1–3 COMPLETE and verified: scaffold (`c009b1e`), config+state (`6c58b41`), router core (`a77a53c`) + cooldown-invariant fix (`a0bed41`). 69/69 tests, `npx tsc --noEmit` clean. Two independent verifier runs: Pass (initial minor finding fixed in `a0bed41`, re-verified Pass). Native assess was `unassessable` both times → high path → verifier (both Pass). No git remote; nothing pushed.
+Status at handoff: branch `feat/claude-bridge-rotator`; work-tree clean; HEAD `683799d` (Unit 2 work-unit commit). Tasks 1–5 COMPLETE and verified: scaffold (`c009b1e`), config+state (`6c58b41`), router core (`a77a53c`) + cooldown fix (`a0bed41`), extension entry + commands (`683799d`, one commit covering Unit 2 = tasks 4–5). 103/103 tests (config 16, state 10, router 43, commands 23, extension 11), `npx tsc --noEmit` clean. Independent verifier for `683799d`: 9/9 confirm, zero defects. No git remote; nothing pushed.
+
+Native review of Unit 2 CLOSED and BURNED (2026-10-01, same session): lineage `review-894c5c8aa9bca5a6` (compact-v2), candidate = committed range `7244529…` → `683799d` (8 files / 3282 changed lines incl. lockfile, tier medium, lens `review-reliability`). Reviewer relay ran clean with the user-swapped model (one materialize run, no transport failures). Closed `approved` on the last admitted event; acknowledgement burned via the facade (operation `acknowledge-approved`, no input, target not drifted — the whole lifecycle ran before any post-review commit). Consumed revision `sha256:8a96aa95…`. Three advisory findings (all non-blocking, informational, separate later work; full text in `.git/gentle-ai/review-transactions/`):
+- R3-login-unquoted-path — SUGGESTION — `src/commands.ts:151`
+- R3-probe-no-deadline — WARNING — `src/commands.ts:226-229`
+- R3-state-publisher-divergence — WARNING — `src/index.ts:168-171`
+
+START quirk recorded: `baseRef` must be a FULL 40-char commit id (abbreviated ids are rejected `base-ref-unresolvable`); `7244529` → `724452995bb45ec33e62d62685e411086877515c`. Assess for this candidate returned `unassessable` again (same schema-incompatible native failure) → high path → writer self-verification + independent verifier (both done). Do NOT start a review for docs-only commits after `683799d` (passive documentation-only edits are review-exempt).
 
 Native review CLOSED (2026-10-01): lineage `review-6e0032ea2de3585c` (compact-v2), candidate = committed range base `0871619d…`→ `76cae4b` (16 files / 3870 lines, tier medium, lens `review-reliability`). Root cause of the two prior reviewer transport failures: the host reviewer model `glm-5.3` (reasoning-heavy) consumed the entire output budget before emitting the review artifact (empty output, `stopReason: length`); the user swapped the reviewer-relay model to a better one, after which the materialize slot ran clean and the review closed **approved** on the last admitted event. The exact provider-issued acknowledgement was executed via native CLI with its exact token (facade `acknowledge-approved` was blocked by target drift: the current workspace target `sha256:6412d086…` differs from the frozen candidate `sha256:a5dca793…` because of the docs commit `e452c7e`); burn confirmed from its returned envelope: authority `burned`, consumed revision `sha256:45cda0c8…`. Review outcome is informational; delivery (push/PR/merge) remains user-owned. Do NOT start a review for the newer docs-only target identity — the delta over the approved candidate is documentation-only.
 
@@ -103,12 +110,11 @@ Full finding text lives in the native review store (`.git/gentle-ai/review-trans
 1. Read this document fully — it is the authority for design, decisions, and contract facts.
 2. Recover context: `mem_context`, then `mem_search "pi-claude-bridge-rotator"`, `mem_get_observation` on the mirror (topic `odd/pi-claude-bridge-rotator/tasks`) and the research memory (topic `claude-account-rotation-strategy`).
 3. Rebuild the visible todo list from the Tasks section (tasks 1–3 done; task 4 next).
-4. BEFORE delegating tasks 4–5, re-read the bridge extension mechanics: how `@vanillagreen/pi-claude-bridge` discovers the router symbol at runtime, its load/shutdown hooks, `probeProfile` usage, and the Pi extension API for command registration (`ctx.registerCommand` style; check bridge `src/index.ts` and the installed `@earendil-works/pi-coding-agent` extension types). Record exact API facts in this doc before writing the worker prompt.
-5. Delegate tasks 4–5 as ONE `gentle-ai-worker` run (Unit 2), foreground `mode: task`, writer model `ollama-cloud/deepseek-v4.1-flash` effort `high`. Allowed edit surfaces: `package.json`, `package-lock.json`, `README.md`, `src/**`, `test/**` (tsconfig/vitest/LICENSE/.gitignore exist; unit 2 needs the `@earendil-works/pi-coding-agent` devDep). Worker does NOT commit.
-6. Worker verification: `npx tsc --noEmit`, `npx vitest run` (node_modules already installed).
-7. After the writer returns: review evidence, make work-unit commits (conventional messages), then `gentle_review` assess per RDD with writer profile `ollama-cloud/deepseek-v4.1-flash`, effort `high`, baseRef `a0bed41`. If assess is `unassessable` again, run an independent `gentle-ai-verify` (read-only, authorized commands: tsc + vitest + scoped review points) as the high-risk path.
-8. Then task 6 (README + `pi install .` verification + smoke); task 7 is the user's live login of both accounts + rotation check.
-9. Contract facts for the worker prompt are in Architecture + Learnings above; the bridge authority file is read-only reference, never imported at runtime.
+4. ~~Re-read bridge extension mechanics~~ DONE — facts recorded in "Extension API facts" under Learnings and verified in review.
+5. ~~Delegate tasks 4–5 as ONE `gentle-ai-worker` run (Unit 2)~~ DONE — commit `683799d`, verifier 9/9, native review approved + burned.
+6. Next: task 6 — README polish + local `pi install .` verification + smoke test (pi lists the package; `/reload`; `Symbol.for("kendex.pi.claude-account-router.v1")` resolves after load with a valid config present). Delegate README edits to a writer if multi-file; the install/smoke runs parent-inline (state-mutating but mechanical).
+7. Then task 7 (user-managed): user logs in both accounts via the printed `CLAUDE_CONFIG_DIR=… claude login` commands, then verifies live rotation (bridge consuming the router, alternation across sessions, cooldown handling).
+8. Optional later: advisory findings (Unit 1: R3-001…007; Unit 2: R3-login-unquoted-path, R3-probe-no-deadline, R3-state-publisher-divergence) — separate non-blocking work.
 
 ## Learnings so far
 
@@ -153,3 +159,15 @@ Full finding text lives in the native review store (`.git/gentle-ai/review-trans
   npm's resolver loop on the "before" cutoff; `npm install` exit 0 + vitest/tsc
   resolving proves a consistent tree. A dev-only audit advisory on vitest <3.2.4
   is resolved by the pinned `^3.2.7`.
+- Unit 2 npm quirk: `@earendil-works/pi-coding-agent` 0.99.1 was published 2026-09-29,
+  inside the `min-release-age=30d` window → plain `npm install` fails ETARGET on the
+  exact pin. Resolved by running `npm install --min-release-age=0` for that one
+  command; the lockfile pins it, so subsequent installs resolve from the lock.
+- Unit 2 reload coherence (accepted v1 limitation, reviewer-confirmed):
+  command state is process-global (`Symbol.for("pi-claude-bridge-rotator:commandState")`)
+  so a pre-`/reload` handler reads the newest activation's config/router, while the
+  published router symbol keeps the FIRST instance's router (ownership ratchet).
+  Divergence is bounded: status truth reads the symbol directly, the state file stays
+  atomic (last mutator wins), and a fresh process reads coherent disk state.
+- Native review START requires the FULL 40-char commit id for `baseRef` — abbreviated
+  ids are rejected (`base-ref-unresolvable`, no lineage created).
