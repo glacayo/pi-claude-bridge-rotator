@@ -68,7 +68,7 @@ Zero modifications to the bridge — the contract is the designed extension poin
 - [x] 3. Router core `ClaudeAccountRouterV1` with TDD tests
 - [x] 4. Extension entry: symbol publish/cleanup + bridge-absent warning
 - [x] 5. Commands `/claude-accounts status|login|reset|probe`
-- [ ] 6. README + local `pi install` verification + smoke test
+- [x] 6. README + local `pi install` verification + smoke test
 - [ ] 7. User: login both accounts + live rotation verification (user-managed)
 
 ## Evidence
@@ -80,12 +80,12 @@ Zero modifications to the bridge — the contract is the designed extension poin
 | 3 | a77a53c + a0bed41 | 69/69 tests pass, tsc clean; independent verifier Pass (minor cooldown-invariant defect found, fixed in a0bed41, re-verified Pass) |
 | 4 | 683799d | tsc clean; vitest 103/103; independent verifier Pass (9/9 confirm, zero defects); native review approved + burned (lineage `review-894c5c8aa9bca5a6`) |
 | 5 | 683799d | 23 command tests + 11 extension tests; command registration + ownership covered; same verifier/review as task 4 (one work-unit commit for Unit 2) |
-| 6 | (pending) | pi list shows package, symbol resolution smoke |
+| 6 | 7498322 + docs commit | `pi install .` → `pi list` shows package; SDK smoke: router PUBLISHED (contract callable, `resolveProfile` returns exact configDir), bridge account host coexists; temp smoke config removed (dormant until task 7) |
 | 7 | (pending) | user confirms live rotation |
 
 ## Resume instructions (for the next Pi session in this repo)
 
-Status at handoff: branch `feat/claude-bridge-rotator`; work-tree clean; HEAD `683799d` (Unit 2 work-unit commit). Tasks 1–5 COMPLETE and verified: scaffold (`c009b1e`), config+state (`6c58b41`), router core (`a77a53c`) + cooldown fix (`a0bed41`), extension entry + commands (`683799d`, one commit covering Unit 2 = tasks 4–5). 103/103 tests (config 16, state 10, router 43, commands 23, extension 11), `npx tsc --noEmit` clean. Independent verifier for `683799d`: 9/9 confirm, zero defects. No git remote; nothing pushed.
+Status at handoff: branch `feat/claude-bridge-rotator`; work-tree clean; HEAD after task 6 docs commit. Tasks 1–6 COMPLETE: scaffold (`c009b1e`), config+state (`6c58b41`), router core (`a77a53c`) + cooldown fix (`a0bed41`), extension entry + commands (`683799d`), README (`7498322`), pi install + smoke verified. 103/103 tests, `npx tsc --noEmit` clean. Package INSTALLED locally: `pi install .` → `pi list` shows `../../localhost/pi-claude-bridge-rotator` (settings path reference, live checkout, no copy). SDK smoke PASSED: a real pi session (in-memory SessionManager, no model call) loaded the extension, published the router, the contract was callable live (`acquire` → `resolveProfile` returned the exact configDir), and the bridge account host coexisted (`probeProfile=function`). The smoke config was REMOVED — the rotator is DORMANT (no config → command registers, nothing publishes, bridge unaffected) until task 7.
 
 Native review of Unit 2 CLOSED and BURNED (2026-10-01, same session): lineage `review-894c5c8aa9bca5a6` (compact-v2), candidate = committed range `7244529…` → `683799d` (8 files / 3282 changed lines incl. lockfile, tier medium, lens `review-reliability`). Reviewer relay ran clean with the user-swapped model (one materialize run, no transport failures). Closed `approved` on the last admitted event; acknowledgement burned via the facade (operation `acknowledge-approved`, no input, target not drifted — the whole lifecycle ran before any post-review commit). Consumed revision `sha256:8a96aa95…`. Three advisory findings (all non-blocking, informational, separate later work; full text in `.git/gentle-ai/review-transactions/`):
 - R3-login-unquoted-path — SUGGESTION — `src/commands.ts:151`
@@ -112,8 +112,8 @@ Full finding text lives in the native review store (`.git/gentle-ai/review-trans
 3. Rebuild the visible todo list from the Tasks section (tasks 1–3 done; task 4 next).
 4. ~~Re-read bridge extension mechanics~~ DONE — facts recorded in "Extension API facts" under Learnings and verified in review.
 5. ~~Delegate tasks 4–5 as ONE `gentle-ai-worker` run (Unit 2)~~ DONE — commit `683799d`, verifier 9/9, native review approved + burned.
-6. Next: task 6 — README polish + local `pi install .` verification + smoke test (pi lists the package; `/reload`; `Symbol.for("kendex.pi.claude-account-router.v1")` resolves after load with a valid config present). Delegate README edits to a writer if multi-file; the install/smoke runs parent-inline (state-mutating but mechanical).
-7. Then task 7 (user-managed): user logs in both accounts via the printed `CLAUDE_CONFIG_DIR=… claude login` commands, then verifies live rotation (bridge consuming the router, alternation across sessions, cooldown handling).
+6. ~~Task 6 — README + pi install + smoke~~ DONE (2026-10-01, same session).
+7. FINAL, user-managed (task 7): user creates `${PI_CODING_AGENT_DIR:-~/.pi/agent}/claude-bridge-rotator.json` with their two real profiles (README has the exact shape), runs the `CLAUDE_CONFIG_DIR=… claude login` commands that `/claude-accounts login` prints (or from the README), `/reload`s, and verifies live rotation: `/claude-accounts status` shows both profiles + identities (probe), fresh pi sessions alternate profiles, and a rate limit moves traffic to the other account.
 8. Optional later: advisory findings (Unit 1: R3-001…007; Unit 2: R3-login-unquoted-path, R3-probe-no-deadline, R3-state-publisher-divergence) — separate non-blocking work.
 
 ## Learnings so far
@@ -171,3 +171,13 @@ Full finding text lives in the native review store (`.git/gentle-ai/review-trans
   atomic (last mutator wins), and a fresh process reads coherent disk state.
 - Native review START requires the FULL 40-char commit id for `baseRef` — abbreviated
   ids are rejected (`base-ref-unresolvable`, no lineage created).
+- Local `pi install .` registers a settings PATH reference (`~/.pi/agent/settings.json`
+  gains `"../../localhost/pi-claude-bridge-rotator"`), NOT a copy — the extension loads
+  the live checkout; `pi list` shows it under "User packages".
+- SDK smoke pattern (no model call): a script importing `@earendil-works/pi-coding-agent`
+  with `createAgentSession({ sessionManager: SessionManager.inMemory() })` loads all
+  settings-discovered extensions; inspect `globalThis[Symbol.for(…)]` in-process to verify
+  symbol contracts. Verified both sides coexist: rotator router + bridge account host.
+- Dormant-by-default: with NO config file the extension registers `/claude-accounts`
+  but publishes nothing — a safe resting state; deleting the config deactivates routing
+  without uninstalling.
