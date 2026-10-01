@@ -134,7 +134,7 @@ prompt-cache loss.
 - [x] 0. CI hardening: pin `actions/checkout` and `actions/setup-node` to commit
   SHAs and set `persist-credentials: false` (zizmor `unpinned-uses`,
   `artipacked`). Route: inline (one mechanical file).
-- [ ] 1. Usage in status: new `src/usage.ts` (credential read + fetch + typed
+- [x] 1. Usage in status: new `src/usage.ts` (credential read + fetch + typed
   result + normalizer), `usage` state section, async `status` that fetches all
   profiles in parallel and renders `usage: 5h N% (resets …) · weekly N%
   (resets …)` or the failure reason with last-known age, expired-token probe
@@ -155,7 +155,7 @@ prompt-cache loss.
 | Task | Commit | Checks |
 |---|---|---|
 | 0 | c1e6654 (+ docs f7e12b2, 182f054; chore 0853144) | SHAs resolved from `git ls-remote` (`v4` = `v4.4.0` for both); zizmor delta clean; tsc clean; vitest 134/134; assess `high` (`shell_source` in `ci.yml`) → independent verifier PASS 6/6; native review folded into the task 1 review (base `217d59d`, so these bytes are reviewed with it); CI run proven on the first stage PR |
-| 1 | (pending) | |
+| 1 | 59932aa | tsc clean; vitest 197/197 (usage 36, router 49, commands 53, state 14, config 22, login 9, extension 14); live `fetchPlanUsage` against both real accounts OK, no token in output (claude-1 5h 0% / weekly 0%; claude-2 5h 57% / weekly 19%); independent verifier PASS 10/10; native review approved + burned (lineage `review-8c8d05f9622e0472`, range `217d59d..59932aa` incl. task 0, tier high, 4 lenses; readability needed one reoffered retry after a reviewer tool-call transport failure). Advisory: R2-last-known-indent, R2-probe-deadline-name, R3-001, R4-probe-sequential-latency, R4-status-probe-latency (status can take up to ~20 s when a token is expired and the probe runs) |
 | 2 | (pending) | |
 | 3 | (pending) | |
 | 4 | (pending) | |
@@ -165,6 +165,8 @@ prompt-cache loss.
 - 2026-10-01: branch `feat/usage-aware-routing` created from `main` at
   `217d59d` (PR #1 merged). Exploration done, design recorded.
 - Chain strategy chosen (`feature-branch-chain`); task 0 done.
-- Review boundary: last reviewed = `217d59d` (main). Task 0 is reviewed together
-  with task 1 (one 4-lens cycle instead of a separate one for 3 YAML lines).
-- Next: task 1 on branch `feat/usage-status` (delegated writer).
+- Review boundary: last reviewed = `59932aa` (tasks 0 + 1 reviewed together).
+  Actual task 1 size was ~1350 changed lines incl. tests and docs (forecast
+  ~450): the full test list and README were required, nothing was dropped.
+- Next: PR-1 `feat/usage-status` → `feat/usage-aware-routing`; then task 2 on
+  `feat/usage-balancer`.
