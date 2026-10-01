@@ -120,12 +120,18 @@ prompt-cache loss.
 - Forecast: about 1350 authored changed lines (T0 ~20, T1 ~450, T2 ~550,
   T3 ~350). This exceeds the ~400-line budget, so the delivery strategy is
   `ask-on-risk`; the chain strategy is asked once before the first commit.
-- Chain strategy: pending (user decision).
-- Slice boundaries: pending.
+- Chain strategy: `feature-branch-chain` (user decision, 2026-10-01).
+  Integration branch `feat/usage-aware-routing`; each stage gets its own
+  branch and PR into it, and one final PR merges the integration branch into
+  `main`.
+- Slices: PR-A = tasks 0 + docs on the integration branch base (pushed
+  directly), PR-1 = task 1 (`feat/usage-status`), PR-2 = task 2
+  (`feat/usage-balancer`), PR-3 = task 3 (`feat/usage-cache-switch`), final
+  PR = integration → `main`.
 
 ## Tasks
 
-- [ ] 0. CI hardening: pin `actions/checkout` and `actions/setup-node` to commit
+- [x] 0. CI hardening: pin `actions/checkout` and `actions/setup-node` to commit
   SHAs and set `persist-credentials: false` (zizmor `unpinned-uses`,
   `artipacked`). Route: inline (one mechanical file).
 - [ ] 1. Usage in status: new `src/usage.ts` (credential read + fetch + typed
@@ -148,7 +154,7 @@ prompt-cache loss.
 
 | Task | Commit | Checks |
 |---|---|---|
-| 0 | (pending) | |
+| 0 | ci commit after the doc commit | SHAs resolved from `git ls-remote` (`v4` = `v4.4.0` for both); zizmor delta clean; CI run proven on the first stage PR |
 | 1 | (pending) | |
 | 2 | (pending) | |
 | 3 | (pending) | |
@@ -158,4 +164,5 @@ prompt-cache loss.
 
 - 2026-10-01: branch `feat/usage-aware-routing` created from `main` at
   `217d59d` (PR #1 merged). Exploration done, design recorded.
-- Next: user picks the chain strategy, then task 0.
+- Chain strategy chosen (`feature-branch-chain`); task 0 done.
+- Next: task 1 on branch `feat/usage-status` (delegated writer).
