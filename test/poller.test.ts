@@ -2,8 +2,9 @@
 // no network, and no filesystem. The fake timer seam captures the scheduled
 // callbacks so the tests fire them by hand.
 
-import { describe, expect, it } from "vitest";
-import { profile } from "./helpers.js";
+import { afterEach, describe, expect, it } from "vitest";
+import { join } from "node:path";
+import { cleanupTempDirs, makeTempDir, profile } from "./helpers.js";
 import { UsagePoller, USAGE_POLL_INTERVAL_MS, USAGE_REFRESH_THROTTLE_MS } from "../src/poller.js";
 import type {
 	UsagePollerOptions,
@@ -12,9 +13,13 @@ import type {
 } from "../src/poller.js";
 import type { FetchUsage } from "../src/commands.js";
 import type { RotatorProfileConfig } from "../src/config.js";
+import { RotatorStateStore } from "../src/state.js";
+import { USAGE_429_MIN_BACKOFF_MS, USAGE_SHARED_FRESH_MS } from "../src/usage-lease.js";
 import type { UsageFetchResult, UsageSnapshot } from "../src/usage.js";
 
 const NOW = 1_800_000_000_000;
+
+afterEach(cleanupTempDirs);
 
 function okSnapshot(fetchedAtMs = NOW): UsageSnapshot {
 	return {
@@ -465,5 +470,94 @@ describe("fault isolation", () => {
 		await flush();
 
 		expect(calls).toEqual([{ configDir: "/tmp/rotator-accounts/a", signal: undefined }]);
+	});
+});
+
+describe("shared fetch lease across processes", () => {
+	/** A router stub that also persists a successful snapshot into the shared
+	 *  store, the way the real router does, so the fresh-window check is real. */
+	function persistingRouterStub(store: RotatorStateStore): RouterStub {
+		const records: Array<{ profileId: string; result: UsageFetchResult }> = [];
+		return {
+			records,
+			recordPlanUsage: (profileId, result) => {
+				records.push({ profileId, result });
+				if (result.ok) {
+					store.update((state) => {
+						state.usage[profileId] = { snapshot: result.snapshot };
+					});
+				}
+			},
+		};
+	}
+
+	it("makes exactly one fetch per profile across six pollers, and one more after the fresh window", async () => {
+		const statePath = join(makeTempDir(), "state.json");
+		let current = NOW;
+		const profiles = [profile("a"), profile("b")];
+		const seam = timerSeam();
+		const fetchDirs: string[] = [];
+		const pollers: UsagePoller[] = [];
+		for (let index = 0; index < 6; index += 1) {
+			const store = new RotatorStateStore({ statePath, now: () => current });
+			const router = persistingRouterStub(store);
+			pollers.push(build({
+				fetchUsage: async ({ configDir }) => {
+					fetchDirs.push(configDir);
+					return { ok: true, snapshot: { fetchedAtMs: current, windows: {} } };
+				},
+				getTargets: () => ({ router, profiles, stateStore: store }),
+				seam,
+				now: () => current,
+			}));
+		}
+		for (const poller of pollers) poller.start();
+		expect(seam.timeouts).toHaveLength(6);
+		expect(seam.intervals).toHaveLength(6);
+
+		// Six pollers fire at the same instant: the shared lease lets about one
+		// request per profile through, not six.
+		for (const timer of seam.timeouts) timer.fn();
+		await flush();
+		expect(fetchDirs).toHaveLength(2);
+
+		// Still inside the fresh window: the shared snapshot is reused, no refetch.
+		for (const timer of seam.timeouts) timer.fn();
+		await flush();
+		expect(fetchDirs).toHaveLength(2);
+
+		// Past the fresh window: exactly one more fetch per profile.
+		current += USAGE_SHARED_FRESH_MS + 1;
+		for (const timer of seam.intervals) timer.fn();
+		await flush();
+		expect(fetchDirs).toHaveLength(4);
+	});
+
+	it("skips a profile in 429 backoff without fetching or warning", async () => {
+		const statePath = join(makeTempDir(), "state.json");
+		const current = NOW;
+		const store = new RotatorStateStore({ statePath, now: () => current });
+		store.update((state) => {
+			state.usageFetch.a = { backoffUntilMs: current + USAGE_429_MIN_BACKOFF_MS };
+		});
+		const seam = timerSeam();
+		const warnings: string[] = [];
+		const fetch = scriptedFetch({ ok: true, snapshot: okSnapshot() });
+		const router = routerStub();
+		const poller = build({
+			fetchUsage: fetch.fetchUsage,
+			getTargets: () => ({ router, profiles: [profile("a")], stateStore: store }),
+			seam,
+			now: () => current,
+			onWarn: (message) => warnings.push(message),
+		});
+
+		poller.start();
+		seam.timeouts[0]?.fn();
+		await flush();
+
+		expect(fetch.calls()).toBe(0);
+		expect(router.records).toHaveLength(0);
+		expect(warnings).toEqual([]);
 	});
 });

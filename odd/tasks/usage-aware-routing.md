@@ -166,6 +166,17 @@ prompt-cache loss.
   and applies the mutator to the fresh disk state; the `state` getter reloads
   when the file changed on disk. Route: delegated writer (multi-file with
   tests). Branch `fix/state-cross-process-writes` → integration branch.
+- [x] 6. Bound usage-endpoint traffic across processes (found live after the
+  merge to `main`): with 4 pi processes, both accounts got HTTP 429 from
+  `/api/oauth/usage` in the same second, because every process runs its own
+  poller plus after-request refreshes. Fix: a shared fetch lease in the state
+  file (claimed under the existing lock) so at most one process fetches a
+  profile per freshness window (~4 min), skip a fetch when the shared
+  snapshot is fresh, and a per-profile backoff after 429 honoring
+  `Retry-After` (minimum 5 min), also respected by manual `status`. Goal:
+  about 1 request per account per window regardless of the number of
+  sessions. Route: delegated writer. Branch `fix/usage-fetch-lease` from
+  `main` (the integration branch is merged).
 
 ## Evidence
 
@@ -176,6 +187,7 @@ prompt-cache loss.
 | 2 | b24d465 | tsc clean; vitest 250/250 (ranking 21, poller 16, router 58, extension 18, commands 56, usage 36, config 22, state 14, login 9); assess `unassessable` (schema-incompatible, treated as high) → independent verifier PASS 9/9 (no blocker/major); native review approved + burned (lineage `review-7c514e8566496832`, range `f498ff3..b24d465`, tier medium, lens `review-reliability`). Includes the fixes for task 1 advisories R4-status-persistent-401-probe (10-min probe backoff) and R3-unauthorized-probe-untested. Advisory: R3-poller-restart-untested, R3-usage-ranking-herd (new sessions all go to the single best account until the next refresh; addressed in task 3). Known benign gap: if the first account is configured mid-session, the poller starts at the next `session_start` (round-robin until then; status still records snapshots) |
 | 3 | d80a874 | tsc clean; vitest 284/284 (ranking 38, router 67, state 20, poller 17, extension 19, commands 56, usage 36, config 22, login 9); independent verifier PASS 9/9 (no defects; the hard-cap move to an UNKNOWN alternative was judged an accepted design risk: staying guarantees a rejection, failover still recovers); native review approved + burned (lineage `review-35a54a64ffb5b036`, range `ad430c5..d80a874`, tier medium, lens `review-reliability`; a first START hit an expired consent binding and was simply re-run). Includes the herd fix (R3-usage-ranking-herd: 5-point penalty per new session since the snapshot) and the missing tests R3-poller-restart-untested and R3-request-refresh-wiring-untested (the poller now clears `inFlight` on stop). Advisory: R3-001 `src/router.ts:174` |
 | 4 | (pending) | partial live evidence recorded under task 4 |
+| 6 | ba4880b | tsc clean; vitest 332/332 (usage 53, state 31, poller 19, usage-lease 13, commands 60, router 68, ranking 38, config 22, login 9, extension 19); real 8-process simultaneous claim on one profile: 1 CLAIMED, 7 skip:lease, no leftover lock; native review approved + burned (lineage `review-070596cf0e9b5bf4`, range `85a9053..ba4880b`, tier medium, lens `review-reliability`). Two pre-existing status tests were updated because status now reuses a fresh shared snapshot instead of always fetching. Advisory: R3-future-snapshot-blocks-fetch `src/usage-lease.ts:62`, R3-poller-lease-release-untested `src/poller.ts:208` |
 | 5 | a564782 + a0665cc | tsc clean; vitest 293/293; real 4-process × 40 concurrent writes: old code kept 107/160 affinities, fixed code 160/160, no leftover lock; native review approved + burned for both commits (`review-257872a53cdff9c0` range `80dd4f0..a564782`; `review-7a6372308a19c5b6` range `a564782..a0665cc`, no findings). The second commit fixes the first review's WARNING R3-update-wipes-memory-on-read-failure (a corrupt file made `update` persist an empty state); its regression test fails on `a564782` and passes after. Remaining advisories: R3-stale-lock-break-race, R3-corrupt-file-warn-repeats, R3-legacy-save-still-clobbers, R3-lock-stale-clock-mismatch. Route: delegated writer for a564782, parent inline for a0665cc (one small, understood change). A full-range START from `main` hits `lens_context_budget_exceeded`; every slice is covered by its own approved review instead |
 
 ## Progress and next step

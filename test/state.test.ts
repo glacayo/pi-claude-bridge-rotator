@@ -235,6 +235,59 @@ describe("usage state sanitization", () => {
 	});
 });
 
+describe("usage fetch lease state", () => {
+	it("defaults usageFetch to an empty map when the field is missing", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		writeFileSync(statePath, JSON.stringify({ version: 1, cursor: 0 }));
+
+		const store = new RotatorStateStore({ statePath });
+
+		expect(store.state.usageFetch).toEqual({});
+	});
+
+	it("keeps valid lease entries and drops empty or malformed ones", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		writeFileSync(statePath, JSON.stringify({
+			version: 1,
+			usageFetch: {
+				a: { leaseUntilMs: 1000, backoffUntilMs: 2000 },
+				b: { leaseUntilMs: 5 },
+				c: { backoffUntilMs: 7 },
+				d: {},
+				e: { leaseUntilMs: -1 },
+				f: { leaseUntilMs: "soon" },
+				g: { backoffUntilMs: null },
+				h: { leaseUntilMs: Number.POSITIVE_INFINITY },
+				i: "not-an-object",
+			},
+		}));
+
+		const store = new RotatorStateStore({ statePath });
+
+		expect(store.state.usageFetch).toEqual({
+			a: { leaseUntilMs: 1000, backoffUntilMs: 2000 },
+			b: { leaseUntilMs: 5 },
+			c: { backoffUntilMs: 7 },
+		});
+	});
+
+	it("round-trips a usageFetch entry through a reload", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		const store = new RotatorStateStore({ statePath });
+
+		store.update((state) => {
+			state.usageFetch.a = { leaseUntilMs: 123, backoffUntilMs: 456 };
+		});
+
+		const reloaded = new RotatorStateStore({ statePath });
+
+		expect(reloaded.state.usageFetch.a).toEqual({ leaseUntilMs: 123, backoffUntilMs: 456 });
+	});
+});
+
 describe("session last-use state", () => {
 	it("defaults the paired last-use map to empty on a fresh state", () => {
 		const dir = makeTempDir();

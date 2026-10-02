@@ -27,6 +27,8 @@ import { DEFAULT_GLOBAL_TARGET, resolveBridgeAccountHost } from "./host.js";
 import type { ProfileUsageError, ProfileUsageRecord, RotatorStateStore } from "./state.js";
 import { fetchPlanUsage } from "./usage.js";
 import type { UsageFetchResult, UsageWindow, UsageWindowName } from "./usage.js";
+import { claimUsageFetch, completeUsageFetch } from "./usage-lease.js";
+import type { UsageFetchClaim } from "./usage-lease.js";
 import type { UsagePoller } from "./poller.js";
 
 export type NotifyLevel = "info" | "warning" | "error";
@@ -200,13 +202,21 @@ async function runStatus(state: RotatorCommandState, ctx: RotatorCommandContext,
 	const store = router.stateStore;
 	const nowMs = deps.now();
 
-	// Every profile is polled in parallel: status must stay one round trip slow,
-	// not one per account. The default fetcher never throws. When a token is
-	// expired or unauthorized and the bridge host is present, give the official
-	// CLI exactly ONE chance to refresh it (a probe under that config dir), then
-	// re-fetch once. The rotator itself never touches credentials.
+	// Claim the cross-process fetch lease for every profile up front. A profile
+	// with a fresh shared snapshot, a 429 backoff, or a lease held by another
+	// process is not fetched; only the claimed ones are. Every profile is still
+	// polled in parallel, so status stays one round trip slow, not one per
+	// account. The default fetcher never throws. When a token is expired or
+	// unauthorized and the bridge host is present, give the official CLI exactly
+	// ONE chance to refresh it (a probe under that config dir), then re-fetch
+	// once. The rotator itself never touches credentials.
 	const cwd = ctx.cwd !== undefined && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
-	const results = await Promise.all(config.profiles.map(async (profile) => {
+	const claims = new Map<string, UsageFetchClaim>();
+	for (const profile of config.profiles) {
+		claims.set(profile.id, claimUsageFetch(store, profile.id, nowMs));
+	}
+	const results = await Promise.all(config.profiles.map(async (profile): Promise<UsageFetchResult | undefined> => {
+		if (claims.get(profile.id)?.fetch !== true) return undefined;
 		const first = await deps.fetchUsage({ configDir: profile.configDir });
 		const needsRefresh = !first.ok && (first.reason === "token-expired" || first.reason === "unauthorized");
 		if (!needsRefresh || host === undefined) return first;
@@ -222,7 +232,9 @@ async function runStatus(state: RotatorCommandState, ctx: RotatorCommandContext,
 	}));
 	config.profiles.forEach((profile, index) => {
 		const result = results[index];
-		if (result !== undefined) router.recordPlanUsage(profile.id, result);
+		if (result === undefined) return;
+		router.recordPlanUsage(profile.id, result);
+		completeUsageFetch(store, profile.id, result, deps.now());
 	});
 
 	for (const profile of config.profiles) {
@@ -232,9 +244,8 @@ async function runStatus(state: RotatorCommandState, ctx: RotatorCommandContext,
 		lines.push(`  configDir: ${profile.configDir}`);
 		lines.push(`  cooldown: ${cooldownLabel(store, profile.id, nowMs)}`);
 		const usageRecord = router.planUsage(profile.id);
-		const usageLine = formatUsageLine(usageRecord, profile.id, nowMs);
+		const { usageLine, lastKnownLine } = statusUsageLines(usageRecord, profile.id, claims.get(profile.id), nowMs);
 		if (usageLine !== undefined) lines.push(`  ${usageLine}`);
-		const lastKnownLine = formatLastKnownLine(usageRecord, nowMs);
 		if (lastKnownLine !== undefined) lines.push(`  ${lastKnownLine}`);
 		if (store.state.invalid.includes(profile.id)) {
 			lines.push(`  invalid: needs relogin — run /claude-accounts login ${profile.id}`);
@@ -759,11 +770,65 @@ function formatUsageLine(
 	return `usage: ${formatUsageWindows(record.snapshot.windows, nowMs, true)}`;
 }
 
-/** Continuation line shown when a refresh failed but a snapshot exists. */
-function formatLastKnownLine(record: ProfileUsageRecord | undefined, nowMs: number): string | undefined {
-	if (record?.lastError === undefined || record.snapshot === undefined) return undefined;
+/** Usage line built straight from an existing snapshot, ignoring any `lastError`
+ *  recorded after it. Used when status reuses a fresh shared snapshot or when
+ *  another process holds the fetch lease. */
+function formatSnapshotLine(record: ProfileUsageRecord | undefined, nowMs: number): string | undefined {
+	if (record?.snapshot === undefined) return undefined;
+	return `usage: ${formatUsageWindows(record.snapshot.windows, nowMs, true)}`;
+}
+
+/** Rate-limit line shown while a 429 backoff is active. */
+function formatRateLimitedLine(retryAtMs: number | undefined, nowMs: number): string {
+	if (retryAtMs === undefined || retryAtMs <= nowMs) {
+		return "usage: unavailable — usage endpoint rate limited";
+	}
+	return `usage: unavailable — usage endpoint rate limited, retrying in ${formatDuration(retryAtMs - nowMs)}`;
+}
+
+/** `last known …` line built from any snapshot, even when the record carries no
+ *  `lastError`. */
+function formatLastKnownSnapshotLine(record: ProfileUsageRecord | undefined, nowMs: number): string | undefined {
+	if (record?.snapshot === undefined) return undefined;
 	const age = formatDuration(Math.max(0, nowMs - record.snapshot.fetchedAtMs));
 	return `  last known ${age} ago: ${formatUsageWindows(record.snapshot.windows, nowMs, false)}`;
+}
+
+interface UsageStatusLines {
+	usageLine?: string | undefined;
+	lastKnownLine?: string | undefined;
+}
+
+/** Pick the usage and last-known lines for one profile from its stored record
+ *  and the shared-fetch claim that produced (or skipped) this status fetch. */
+function statusUsageLines(
+	record: ProfileUsageRecord | undefined,
+	profileId: string,
+	claim: UsageFetchClaim | undefined,
+	nowMs: number,
+): UsageStatusLines {
+	if (claim !== undefined && claim.fetch === false) {
+		if (claim.reason === "backoff") {
+			return {
+				usageLine: formatRateLimitedLine(claim.retryAtMs, nowMs),
+				lastKnownLine: formatLastKnownSnapshotLine(record, nowMs),
+			};
+		}
+		// Fresh or lease-held: another process just fetched or is fetching, so render
+		// the last known snapshot instead of a stale error.
+		const snapshotLine = formatSnapshotLine(record, nowMs);
+		if (snapshotLine !== undefined) return { usageLine: snapshotLine };
+	}
+	return {
+		usageLine: formatUsageLine(record, profileId, nowMs),
+		lastKnownLine: formatLastKnownLine(record, nowMs),
+	};
+}
+
+/** Continuation line shown when a refresh failed but a snapshot exists. */
+function formatLastKnownLine(record: ProfileUsageRecord | undefined, nowMs: number): string | undefined {
+	if (record?.lastError === undefined) return undefined;
+	return formatLastKnownSnapshotLine(record, nowMs);
 }
 
 function usageFailureText(error: ProfileUsageError, profileId: string): string {

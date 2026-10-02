@@ -15,6 +15,8 @@
 
 import type { FetchUsage } from "./commands.js";
 import type { RotatorProfileConfig } from "./config.js";
+import type { RotatorStateStore } from "./state.js";
+import { claimUsageFetch, completeUsageFetch } from "./usage-lease.js";
 import { fetchPlanUsage } from "./usage.js";
 import type { UsageFetchResult } from "./usage.js";
 
@@ -35,6 +37,9 @@ export interface UsagePollerRouter {
 export interface UsagePollerTarget {
 	router: UsagePollerRouter;
 	profiles: readonly RotatorProfileConfig[];
+	/** Shared store used for cross-process fetch coordination. When omitted (an
+	 *  older wiring or a test double) the poller fetches without a lease. */
+	stateStore?: RotatorStateStore | undefined;
 }
 
 export interface UsagePollerOptions {
@@ -147,7 +152,7 @@ export class UsagePoller {
 			const lastRefreshMs = this.lastRefreshAtMs.get(profileId);
 			if (lastRefreshMs !== undefined && nowMs - lastRefreshMs < USAGE_REFRESH_THROTTLE_MS) return;
 			this.lastRefreshAtMs.set(profileId, nowMs);
-			void this.refreshProfile(targets.router, profile, this.generation);
+			void this.refreshProfile(targets, profile, this.generation);
 		} catch (error) {
 			this.warnOnce("request-refresh", `could not schedule a usage refresh: ${describeError(error)}`);
 		}
@@ -159,7 +164,7 @@ export class UsagePoller {
 		if (targets === undefined) return;
 		for (const profile of targets.profiles) {
 			if (!this.running || generation !== this.generation) return;
-			await this.refreshProfile(targets.router, profile, generation);
+			await this.refreshProfile(targets, profile, generation);
 		}
 	}
 
@@ -173,28 +178,43 @@ export class UsagePoller {
 	}
 
 	private async refreshProfile(
-		router: UsagePollerRouter,
+		targets: UsagePollerTarget,
 		profile: RotatorProfileConfig,
 		generation: number,
 	): Promise<void> {
 		if (this.inFlight.has(profile.id)) return;
 		this.inFlight.set(profile.id, generation);
+		const store = targets.stateStore;
+		// Cross-process coordination: only the one process that wins the shared
+		// lease (or sees a stale snapshot and no backoff) goes on to fetch. A skip
+		// is a silent no-op, not a failure.
+		if (store !== undefined && !claimUsageFetch(store, profile.id, this.now()).fetch) {
+			if (this.inFlight.get(profile.id) === generation) this.inFlight.delete(profile.id);
+			return;
+		}
 		let result: UsageFetchResult;
 		try {
 			result = await this.fetchUsage({ configDir: profile.configDir });
 		} catch (error) {
 			if (this.inFlight.get(profile.id) === generation) this.inFlight.delete(profile.id);
+			if (store !== undefined) completeUsageFetch(store, profile.id, { ok: false, reason: "network" }, this.now());
 			this.warnOnce("fetch-error", `usage refresh failed: ${describeError(error)}`);
 			return;
 		}
 		if (this.inFlight.get(profile.id) === generation) this.inFlight.delete(profile.id);
-		if (!this.running || generation !== this.generation) return;
+		if (!this.running || generation !== this.generation) {
+			// The result belongs to a stopped poller: do not record it, but still
+			// release the cross-process lease so another process is not blocked.
+			if (store !== undefined) completeUsageFetch(store, profile.id, result, this.now());
+			return;
+		}
 		if (!result.ok) this.warnOnce(result.reason, `usage refresh failed (${result.reason}).`);
 		try {
-			router.recordPlanUsage(profile.id, result);
+			targets.router.recordPlanUsage(profile.id, result);
 		} catch (error) {
 			this.warnOnce("record-error", `could not record usage: ${describeError(error)}`);
 		}
+		if (store !== undefined) completeUsageFetch(store, profile.id, result, this.now());
 	}
 
 	private warnOnce(kind: string, message: string): void {

@@ -12,6 +12,7 @@ import {
 	USAGE_ENDPOINT,
 	fetchPlanUsage,
 	normalizeUsageResponse,
+	parseRetryAfterMs,
 	readOAuthAccessToken,
 } from "../src/usage.js";
 import type { FetchUsageImpl, FetchUsageResponse } from "../src/usage.js";
@@ -36,6 +37,20 @@ function credsDir(oauth: unknown): string {
 
 function okResponse(body: unknown): FetchUsageResponse {
 	return { status: 200, json: async () => body };
+}
+
+/** A response carrying response headers, for the `Retry-After` tests. */
+function headerResponse(
+	status: number,
+	headers: Record<string, string>,
+	body: unknown = {},
+): FetchUsageResponse {
+	const lowered = new Map(Object.entries(headers).map(([name, value]) => [name.toLowerCase(), value]));
+	return {
+		status,
+		json: async () => body,
+		headers: { get: (name) => lowered.get(name.toLowerCase()) ?? null },
+	};
 }
 
 interface RecordedFetch {
@@ -197,6 +212,26 @@ describe("normalizeUsageResponse", () => {
 	});
 });
 
+describe("parseRetryAfterMs", () => {
+	it("parses delta-seconds", () => {
+		expect(parseRetryAfterMs("120", NOW_MS)).toBe(120_000);
+		expect(parseRetryAfterMs("0", NOW_MS)).toBe(0);
+		expect(parseRetryAfterMs("  45  ", NOW_MS)).toBe(45_000);
+	});
+
+	it("parses an HTTP-date relative to now and clamps the past to zero", () => {
+		expect(parseRetryAfterMs(new Date(NOW_MS + 30_000).toUTCString(), NOW_MS)).toBe(30_000);
+		expect(parseRetryAfterMs(new Date(NOW_MS - 30_000).toUTCString(), NOW_MS)).toBe(0);
+	});
+
+	it.each([undefined, null, "", "  ", "not-a-date", "-5", "1.5"]) (
+		"returns undefined for %p",
+		(value) => {
+			expect(parseRetryAfterMs(value, NOW_MS)).toBeUndefined();
+		},
+	);
+});
+
 describe("fetchPlanUsage", () => {
 	it("GETs the usage endpoint with only the bearer header and returns a snapshot", async () => {
 		const dir = credsDir({ accessToken: TOKEN, expiresAt: FUTURE_MS });
@@ -244,6 +279,56 @@ describe("fetchPlanUsage", () => {
 	it("reports another non-2xx status as http-error with the status attached", async () => {
 		const dir = credsDir({ accessToken: TOKEN, expiresAt: FUTURE_MS });
 		const fetch = recordingFetch({ status: 503, json: async () => ({}) });
+
+		const result = await fetchPlanUsage({ configDir: dir, fetchImpl: fetch.impl, now: () => NOW_MS });
+
+		expect(result).toEqual({ ok: false, reason: "http-error", httpStatus: 503 });
+	});
+
+	it("captures Retry-After delta-seconds on an HTTP 429", async () => {
+		const dir = credsDir({ accessToken: TOKEN, expiresAt: FUTURE_MS });
+		const fetch = recordingFetch(headerResponse(429, { "Retry-After": "120" }));
+
+		const result = await fetchPlanUsage({ configDir: dir, fetchImpl: fetch.impl, now: () => NOW_MS });
+
+		expect(result).toEqual({ ok: false, reason: "http-error", httpStatus: 429, retryAfterMs: 120_000 });
+	});
+
+	it("captures an HTTP-date Retry-After as a delay from now", async () => {
+		const dir = credsDir({ accessToken: TOKEN, expiresAt: FUTURE_MS });
+		const fetch = recordingFetch(headerResponse(429, { "Retry-After": new Date(NOW_MS + 30_000).toUTCString() }));
+
+		const result = await fetchPlanUsage({ configDir: dir, fetchImpl: fetch.impl, now: () => NOW_MS });
+
+		expect(result).toEqual({ ok: false, reason: "http-error", httpStatus: 429, retryAfterMs: 30_000 });
+	});
+
+	it("clamps an HTTP-date Retry-After in the past to zero", async () => {
+		const dir = credsDir({ accessToken: TOKEN, expiresAt: FUTURE_MS });
+		const fetch = recordingFetch(headerResponse(429, { "Retry-After": new Date(NOW_MS - 30_000).toUTCString() }));
+
+		const result = await fetchPlanUsage({ configDir: dir, fetchImpl: fetch.impl, now: () => NOW_MS });
+
+		expect(result).toEqual({ ok: false, reason: "http-error", httpStatus: 429, retryAfterMs: 0 });
+	});
+
+	it.each([
+		["absent", undefined],
+		["empty", ""],
+		["non-numeric", "not-a-date"],
+		["negative", "-5"],
+	] as const)("omits retryAfterMs for a %s Retry-After", async (_label, header) => {
+		const dir = credsDir({ accessToken: TOKEN, expiresAt: FUTURE_MS });
+		const fetch = recordingFetch(headerResponse(429, header === undefined ? {} : { "Retry-After": header }));
+
+		const result = await fetchPlanUsage({ configDir: dir, fetchImpl: fetch.impl, now: () => NOW_MS });
+
+		expect(result).toEqual({ ok: false, reason: "http-error", httpStatus: 429 });
+	});
+
+	it("ignores Retry-After on a non-429 status", async () => {
+		const dir = credsDir({ accessToken: TOKEN, expiresAt: FUTURE_MS });
+		const fetch = recordingFetch(headerResponse(503, { "Retry-After": "120" }));
 
 		const result = await fetchPlanUsage({ configDir: dir, fetchImpl: fetch.impl, now: () => NOW_MS });
 

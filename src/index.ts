@@ -50,6 +50,7 @@ export type {
 	ProfileUsageRecord,
 	RotatorState,
 	RotatorStateStoreOptions,
+	UsageFetchLease,
 } from "./state.js";
 
 export {
@@ -133,6 +134,7 @@ export {
 	DEFAULT_USAGE_TIMEOUT_MS,
 	fetchPlanUsage,
 	normalizeUsageResponse,
+	parseRetryAfterMs,
 	readOAuthAccessToken,
 	USAGE_ENDPOINT,
 	USAGE_FAILURE_REASONS,
@@ -151,6 +153,16 @@ export type {
 	UsageWindow,
 	UsageWindowName,
 } from "./usage.js";
+
+export {
+	claimUsageFetch,
+	completeUsageFetch,
+	USAGE_429_MAX_BACKOFF_MS,
+	USAGE_429_MIN_BACKOFF_MS,
+	USAGE_FETCH_LEASE_MS,
+	USAGE_SHARED_FRESH_MS,
+} from "./usage-lease.js";
+export type { UsageFetchClaim, UsageFetchSkipReason } from "./usage-lease.js";
 
 export { DEFAULT_LOGIN_TIMEOUT_MS, startClaudeLogin } from "./login.js";
 export type {
@@ -386,7 +398,7 @@ function ensurePoller(
 			const router = state.router;
 			const config = state.config;
 			if (router === undefined || config === undefined) return undefined;
-			return { router, profiles: config.profiles };
+			return { router, profiles: config.profiles, stateStore: router.stateStore };
 		},
 		now,
 		onWarn: deps.onWarn ?? ((message: string) => console.warn(message)),
