@@ -154,7 +154,10 @@ prompt-cache loss.
   vs `claude-2` 5h 42% / weekly 25%), proven by new Claude Code JSONL files
   under `~/.claude-rotator/claude-1/projects/`. Token refresh-by-probe still
   pending (claude-1 access token expires 06:16 UTC). The test exposed the
-  bug fixed by task 5.
+  bug fixed by task 5. After task 5 + `/reload`, a new session's affinity
+  (`claude-1`) and its last-use time persisted alongside this session's entry
+  (`claude-2`), with no leftover lock file (2026-10-02 02:30 UTC). Remaining:
+  token refresh-by-probe, to be checked after the final PR.
 - [x] 5. Fix cross-process state clobbering (found in task 4): with several pi
   processes open, each `RotatorStateStore` keeps an in-memory copy and
   rewrites the whole file, so the last writer erases other processes'
