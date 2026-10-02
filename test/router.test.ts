@@ -674,6 +674,24 @@ describe("createRouter factory", () => {
 		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("a");
 		expect(router.acquire({ modelId: "m", sessionId: "s2" }).profileId).toBe("b");
 	});
+
+	it("keeps both sessions when two routers share a state file", () => {
+		const dir = makeTempDir();
+		const statePath = join(dir, "state.json");
+		const config: RotatorConfig = {
+			policy: "balanced",
+			path: join(dir, "claude-bridge-rotator.json"),
+			profiles: [profile("a"), profile("b")],
+		};
+		const first = createRouter(config, { statePath });
+		const second = createRouter(config, { statePath });
+
+		first.recordSuccess("a", "s1");
+		second.recordSuccess("b", "s2");
+
+		const reloaded = new RotatorStateStore({ statePath });
+		expect(reloaded.state.sessionAffinity).toEqual({ s1: "a", s2: "b" });
+	});
 });
 
 describe("usage-aware ranking", () => {

@@ -10,7 +10,7 @@
 // unreadable file degrades to a fresh state with a warning.
 
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { piAgentDir } from "./config.js";
 import { USAGE_FAILURE_REASONS, USAGE_WINDOW_NAMES } from "./usage.js";
@@ -21,6 +21,16 @@ export const STATE_VERSION = 1;
 /** Session affinity is a resume convenience, not an audit log: keep the most
  *  recently touched sessions only, so the file stays bounded. */
 export const MAX_SESSION_AFFINITY_ENTRIES = 200;
+/** A lock file whose mtime is older than this belonged to a process that died
+ *  mid-write and is safe to break. */
+export const STATE_LOCK_STALE_MS = 5000;
+/** Minimum gap between the state getter's cheap freshness `statSync` checks, so
+ *  a hot `acquire` path does not stat the disk on every read. */
+export const STATE_STAT_THROTTLE_MS = 250;
+/** Lock retry pacing: sleep this long between attempts and give up after the
+ *  total timeout has elapsed (then merge without the lock). */
+export const STATE_LOCK_RETRY_MS = 10;
+export const STATE_LOCK_TIMEOUT_MS = 250;
 
 export interface CooldownRecord {
 	/** Epoch ms at which the profile becomes eligible again. */
@@ -90,6 +100,16 @@ export interface RotatorStateStoreOptions {
 	env?: NodeJS.ProcessEnv | undefined;
 	now?: (() => number) | undefined;
 	onWarn?: ((message: string) => void) | undefined;
+	/** Blocking sleep used between lock retries. Defaults to `Atomics.wait`. */
+	sleep?: ((ms: number) => void) | undefined;
+	/** Lock file path; defaults to `${statePath}.lock`. */
+	lockPath?: string | undefined;
+	/** Age (mtime) past which a lock is considered abandoned. */
+	lockStaleMs?: number | undefined;
+	/** Total time to keep retrying a contended lock before merging unlocked. */
+	lockTimeoutMs?: number | undefined;
+	/** Delay between lock retries. */
+	lockRetryMs?: number | undefined;
 }
 
 export function defaultStatePath(env: NodeJS.ProcessEnv = process.env): string {
@@ -103,6 +123,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function describeError(error: unknown): string {
 	if (error instanceof Error) return error.message;
 	return String(error);
+}
+
+/** Blocking sleep for the synchronous lock retry loop. `Atomics.wait` is the
+ *  only portable way to sleep synchronously in Node without a busy spin. */
+function defaultSleep(ms: number): void {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function positiveOr(value: number | undefined, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -322,35 +352,71 @@ function sanitizeUsageError(value: unknown): ProfileUsageError | undefined {
 
 export class RotatorStateStore {
 	readonly path: string;
+	readonly lockPath: string;
 	private readonly onWarn: (message: string) => void;
+	private readonly now: () => number;
+	private readonly sleep: (ms: number) => void;
+	private readonly lockStaleMs: number;
+	private readonly lockTimeoutMs: number;
+	private readonly lockRetryMs: number;
 	private data: RotatorState;
+	/** Freshness snapshot of the file the in-memory state was read from. */
+	private lastStatAtMs = 0;
+	private lastMtimeMs: number | undefined;
+	private lastSize: number | undefined;
+	private lastIno: number | undefined;
+	private lockWarned = false;
 
 	constructor(options: RotatorStateStoreOptions = {}) {
 		const env = options.env ?? process.env;
 		this.path = resolve(options.statePath ?? defaultStatePath(env));
+		this.lockPath = resolve(options.lockPath ?? `${this.path}.lock`);
 		this.onWarn = options.onWarn ?? ((message: string) => console.warn(message));
+		this.now = options.now ?? (() => Date.now());
+		this.sleep = options.sleep ?? defaultSleep;
+		this.lockStaleMs = positiveOr(options.lockStaleMs, STATE_LOCK_STALE_MS);
+		this.lockTimeoutMs = positiveOr(options.lockTimeoutMs, STATE_LOCK_TIMEOUT_MS);
+		this.lockRetryMs = positiveOr(options.lockRetryMs, STATE_LOCK_RETRY_MS);
 		this.data = this.read();
+		this.recordStat();
 	}
 
-	/** Live state object. Mutate through `update` (or mutate then `save`). */
+	/** Live state object. Reads cheaply re-check the file so a change written by
+	 *  another pi process is picked up within the throttle window. Mutate through
+	 *  `update` (or mutate then `save`). */
 	get state(): RotatorState {
+		this.refreshFromDisk();
 		return this.data;
 	}
 
+	/** Read-merge-write under a short lock file: re-read the on-disk state, apply
+	 *  `mutator` exactly once to that fresh copy, then persist atomically. This
+	 *  keeps concurrent processes from clobbering each other's affinity, cooldown,
+	 *  or cursor changes. Lock problems never throw and never deadlock: a
+	 *  contended lock is retried for a bounded time, a stale one is broken, and
+	 *  the final fallback merges without a lock and warns once. */
 	update(mutator: (state: RotatorState) => void): void {
-		mutator(this.data);
-		this.save();
+		const locked = this.acquireLock();
+		try {
+			const fresh = this.read();
+			mutator(fresh);
+			this.save(fresh);
+			this.data = fresh;
+			this.recordStat();
+		} finally {
+			if (locked) this.releaseLock();
+		}
 	}
 
 	/** Atomic write: sibling temp file, mode 0600, then rename over the target. */
-	save(): void {
+	save(state: RotatorState = this.data): void {
 		const directory = dirname(this.path);
 		mkdirSync(directory, { recursive: true, mode: 0o700 });
 		const tempPath = join(
 			directory,
 			`.${ROTATOR_STATE_FILENAME}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
 		);
-		const payload = `${JSON.stringify(this.data, null, "\t")}\n`;
+		const payload = `${JSON.stringify(state, null, "\t")}\n`;
 		try {
 			// The explicit mode is still subject to umask, so chmod afterwards.
 			writeFileSync(tempPath, payload, { encoding: "utf8", mode: 0o600 });
@@ -366,7 +432,117 @@ export class RotatorStateStore {
 		}
 	}
 
+	/** Reload when the file changed under us, at most once per throttle window. */
+	private refreshFromDisk(): void {
+		const nowMs = this.now();
+		if (nowMs - this.lastStatAtMs < STATE_STAT_THROTTLE_MS) return;
+		let stat: ReturnType<typeof statSync>;
+		try {
+			stat = statSync(this.path);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT") {
+				this.onWarn(
+					`claude-bridge-rotator: state at ${this.path} is unreadable (${describeError(error)}); keeping the in-memory state.`,
+				);
+			}
+			this.lastStatAtMs = nowMs;
+			return;
+		}
+		this.lastStatAtMs = nowMs;
+		if (stat.mtimeMs === this.lastMtimeMs && stat.size === this.lastSize && stat.ino === this.lastIno) return;
+		const fresh = this.readFromDisk("keeping the in-memory state");
+		if (fresh === undefined) return;
+		this.data = fresh;
+		this.lastMtimeMs = stat.mtimeMs;
+		this.lastSize = stat.size;
+		this.lastIno = stat.ino;
+	}
+
+	private recordStat(): void {
+		try {
+			const stat = statSync(this.path);
+			this.lastMtimeMs = stat.mtimeMs;
+			this.lastSize = stat.size;
+			this.lastIno = stat.ino;
+		} catch {
+			this.lastMtimeMs = undefined;
+			this.lastSize = undefined;
+			this.lastIno = undefined;
+		}
+		this.lastStatAtMs = this.now();
+	}
+
+	/** Bounded synchronous lock acquisition. Returns true only when this call
+	 *  created the lock and therefore owns its removal. */
+	private acquireLock(): boolean {
+		try {
+			mkdirSync(dirname(this.lockPath), { recursive: true, mode: 0o700 });
+		} catch (error) {
+			this.warnLock(describeError(error));
+			return false;
+		}
+		const attempts = Math.max(1, Math.ceil(this.lockTimeoutMs / this.lockRetryMs));
+		for (let attempt = 0; attempt < attempts; attempt += 1) {
+			if (this.tryCreateLock()) return true;
+			if (this.lockIsStale()) {
+				this.removeLock();
+				if (this.tryCreateLock()) return true;
+			}
+			if (attempt < attempts - 1) this.sleep(this.lockRetryMs);
+		}
+		this.warnLock("another process is holding it");
+		return false;
+	}
+
+	private tryCreateLock(): boolean {
+		try {
+			closeSync(openSync(this.lockPath, "wx"));
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	private lockIsStale(): boolean {
+		let stat: ReturnType<typeof statSync>;
+		try {
+			stat = statSync(this.lockPath);
+		} catch {
+			// Vanished or unreadable: retry the create immediately.
+			return true;
+		}
+		return Date.now() - stat.mtimeMs > this.lockStaleMs;
+	}
+
+	private removeLock(): void {
+		try {
+			unlinkSync(this.lockPath);
+		} catch {
+			// Already gone (or not removable): nothing to clean up.
+		}
+	}
+
+	private releaseLock(): void {
+		this.removeLock();
+	}
+
+	private warnLock(reason: string): void {
+		if (this.lockWarned) return;
+		this.lockWarned = true;
+		this.onWarn(
+			`claude-bridge-rotator: could not acquire the state lock at ${this.lockPath} (${reason}); merging without a lock.`,
+		);
+	}
+
 	private read(): RotatorState {
+		return this.readFromDisk("starting fresh") ?? emptyRotatorState();
+	}
+
+	/** Parse and sanitize the current file. Returns `undefined` and warns when the
+	 *  file is missing or unreadable so callers can choose whether to start fresh
+	 *  (construction, `update`) or keep the in-memory state (the getter). */
+	private readFromDisk(fallback: string): RotatorState | undefined {
 		let raw: string;
 		try {
 			raw = readFileSync(this.path, "utf8");
@@ -374,10 +550,10 @@ export class RotatorStateStore {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "ENOENT") {
 				this.onWarn(
-					`claude-bridge-rotator: state at ${this.path} is unreadable (${describeError(error)}); starting fresh.`,
+					`claude-bridge-rotator: state at ${this.path} is unreadable (${describeError(error)}); ${fallback}.`,
 				);
 			}
-			return emptyRotatorState();
+			return undefined;
 		}
 
 		try {
@@ -386,9 +562,9 @@ export class RotatorStateStore {
 			return sanitizeState(parsed);
 		} catch (error) {
 			this.onWarn(
-				`claude-bridge-rotator: state at ${this.path} is corrupt (${describeError(error)}); starting fresh.`,
+				`claude-bridge-rotator: state at ${this.path} is corrupt (${describeError(error)}); ${fallback}.`,
 			);
-			return emptyRotatorState();
+			return undefined;
 		}
 	}
 }
