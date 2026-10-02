@@ -398,7 +398,7 @@ export class RotatorStateStore {
 	update(mutator: (state: RotatorState) => void): void {
 		const locked = this.acquireLock();
 		try {
-			const fresh = this.read();
+			const fresh = this.readForUpdate();
 			mutator(fresh);
 			this.save(fresh);
 			this.data = fresh;
@@ -451,7 +451,8 @@ export class RotatorStateStore {
 		}
 		this.lastStatAtMs = nowMs;
 		if (stat.mtimeMs === this.lastMtimeMs && stat.size === this.lastSize && stat.ino === this.lastIno) return;
-		const fresh = this.readFromDisk("keeping the in-memory state");
+		const read = this.readFromDisk("keeping the in-memory state");
+		const fresh = read === "missing" ? undefined : read;
 		if (fresh === undefined) return;
 		this.data = fresh;
 		this.lastMtimeMs = stat.mtimeMs;
@@ -536,23 +537,34 @@ export class RotatorStateStore {
 	}
 
 	private read(): RotatorState {
-		return this.readFromDisk("starting fresh") ?? emptyRotatorState();
+		const read = this.readFromDisk("starting fresh");
+		return read === "missing" || read === undefined ? emptyRotatorState() : read;
 	}
 
-	/** Parse and sanitize the current file. Returns `undefined` and warns when the
-	 *  file is missing or unreadable so callers can choose whether to start fresh
-	 *  (construction, `update`) or keep the in-memory state (the getter). */
-	private readFromDisk(fallback: string): RotatorState | undefined {
+	/** Base state for `update`. A missing file starts fresh, but an unreadable or
+	 *  corrupt one must not: starting from empty would persist an empty state and
+	 *  wipe every affinity, cooldown, and snapshot. Use the in-memory copy then. */
+	private readForUpdate(): RotatorState {
+		const read = this.readFromDisk("merging into the in-memory state");
+		if (read === "missing") return emptyRotatorState();
+		if (read !== undefined) return read;
+		const copy = cloneJsonValue(this.data);
+		return isRecord(copy) ? sanitizeState(copy) : emptyRotatorState();
+	}
+
+	/** Parse and sanitize the current file. Returns `"missing"` when there is no
+	 *  file, and `undefined` (with a warning) when it is unreadable or corrupt, so
+	 *  callers can choose whether to start fresh or keep the in-memory state. */
+	private readFromDisk(fallback: string): RotatorState | "missing" | undefined {
 		let raw: string;
 		try {
 			raw = readFileSync(this.path, "utf8");
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
-			if (code !== "ENOENT") {
-				this.onWarn(
-					`claude-bridge-rotator: state at ${this.path} is unreadable (${describeError(error)}); ${fallback}.`,
-				);
-			}
+			if (code === "ENOENT") return "missing";
+			this.onWarn(
+				`claude-bridge-rotator: state at ${this.path} is unreadable (${describeError(error)}); ${fallback}.`,
+			);
 			return undefined;
 		}
 
