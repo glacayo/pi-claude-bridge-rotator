@@ -283,10 +283,12 @@ describe("status usage", () => {
 			now: () => NOW,
 			fetchUsage: async () => ({ ok: false, reason: "network" }),
 		});
-		h.router.recordPlanUsage("a", { ok: true, snapshot: successSnapshot() });
+		// A stale snapshot: a fresh one is reused without fetching, so this
+		// exercises the real failure path.
+		h.router.recordPlanUsage("a", { ok: true, snapshot: { ...successSnapshot(), fetchedAtMs: NOW - 5 * MINUTE_MS } });
 		await h.run("status");
 		expect(h.lastMessage()).toContain("usage: unavailable — network error");
-		expect(h.lastMessage()).toContain("last known 1m ago: 5h 12% · weekly 34%");
+		expect(h.lastMessage()).toContain("last known 5m ago: 5h 12% · weekly 34%");
 	});
 
 	it.each([
@@ -481,13 +483,110 @@ describe("status usage", () => {
 			return result ?? { ok: false, reason: "network" };
 		};
 		const config: RotatorConfig = { policy: "balanced", path: "/tmp/rotator-config.json", profiles: [profile("a")] };
-		const h = harness(config, { now: () => NOW, host, fetchUsage });
+		let current = NOW;
+		const h = harness(config, { now: () => current, host, fetchUsage });
 
 		await h.run("status");
+		// Past the shared freshness window so the second status refetches; a fresh
+		// snapshot from the first run would otherwise be reused.
+		current += 5 * MINUTE_MS;
 		await h.run("status");
 
 		// A successful refetch is not a backoff: the next failure probes again.
 		expect(probes).toEqual(["a", "a"]);
+	});
+
+	describe("fetch coordination", () => {
+		function oneProfileConfig(): RotatorConfig {
+			return { policy: "balanced", path: "/tmp/rotator-config.json", profiles: [profile("a")] };
+		}
+
+		it("reuses a fresh shared snapshot without fetching", async () => {
+			let calls = 0;
+			const h = harness(oneProfileConfig(), {
+				now: () => NOW,
+				fetchUsage: async () => {
+					calls += 1;
+					return { ok: false, reason: "network" };
+				},
+			});
+			h.router.recordPlanUsage("a", { ok: true, snapshot: successSnapshot() });
+
+			await h.run("status");
+
+			expect(calls).toBe(0);
+			expect(h.lastMessage()).toContain("usage: 5h 12% (resets in 2h10m) · weekly 34% (resets in 3d4h)");
+		});
+
+		it("renders the rate-limited line and the last known snapshot while in backoff, without fetching", async () => {
+			let calls = 0;
+			const h = harness(oneProfileConfig(), {
+				now: () => NOW,
+				fetchUsage: async () => {
+					calls += 1;
+					return { ok: false, reason: "network" };
+				},
+			});
+			h.router.recordPlanUsage("a", {
+				ok: true,
+				snapshot: { ...successSnapshot(), fetchedAtMs: NOW - MINUTE_MS },
+			});
+			h.store.update((state) => {
+				state.usageFetch.a = { backoffUntilMs: NOW + 10 * MINUTE_MS };
+			});
+
+			await h.run("status");
+
+			expect(calls).toBe(0);
+			expect(h.lastMessage()).toContain("usage: unavailable — usage endpoint rate limited, retrying in 10m");
+			expect(h.lastMessage()).toContain("last known 1m ago: 5h 12% · weekly 34%");
+		});
+
+		it("renders the last known snapshot while another process holds the lease, without fetching", async () => {
+			let calls = 0;
+			const h = harness(oneProfileConfig(), {
+				now: () => NOW,
+				fetchUsage: async () => {
+					calls += 1;
+					return { ok: false, reason: "network" };
+				},
+			});
+			h.router.recordPlanUsage("a", {
+				ok: true,
+				snapshot: { ...successSnapshot(), fetchedAtMs: NOW - 10 * MINUTE_MS },
+			});
+			h.store.update((state) => {
+				state.usageFetch.a = { leaseUntilMs: NOW + 30_000 };
+			});
+
+			await h.run("status");
+
+			expect(calls).toBe(0);
+			expect(h.lastMessage()).toContain("usage: 5h 12% (resets in 2h10m) · weekly 34% (resets in 3d4h)");
+		});
+
+		it("records a 429 backoff that the next status renders without refetching", async () => {
+			let current = NOW;
+			let calls = 0;
+			const h = harness(oneProfileConfig(), {
+				now: () => current,
+				fetchUsage: async () => {
+					calls += 1;
+					return { ok: false, reason: "http-error", httpStatus: 429, retryAfterMs: 7 * MINUTE_MS };
+				},
+			});
+
+			await h.run("status");
+
+			expect(calls).toBe(1);
+			expect(h.lastMessage()).toContain("usage: unavailable — usage endpoint returned HTTP 429");
+
+			current += MINUTE_MS;
+			await h.run("status");
+
+			expect(calls).toBe(1);
+			expect(h.lastMessage()).toContain("usage: unavailable — usage endpoint rate limited, retrying in 6m");
+		});
 	});
 });
 

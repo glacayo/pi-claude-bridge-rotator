@@ -77,6 +77,14 @@ export interface ProfileUsageRecord {
 	lastError?: ProfileUsageError;
 }
 
+/** Cross-process plan-usage fetch coordination for one profile. `leaseUntilMs`
+ *  is a short claim so at most one process fetches at a time; `backoffUntilMs`
+ *  is the cooldown after the endpoint answers HTTP 429. Both are epoch ms. */
+export interface UsageFetchLease {
+	leaseUntilMs?: number;
+	backoffUntilMs?: number;
+}
+
 export interface RotatorState {
 	version: number;
 	cooldowns: Record<string, CooldownRecord>;
@@ -93,6 +101,9 @@ export interface RotatorState {
 	failures: Record<string, ProfileFailure>;
 	/** Normalized plan usage per profile id (see `src/usage.ts`). */
 	usage: Record<string, ProfileUsageRecord>;
+	/** Shared fetch lease/backoff per profile id, claimed under the state lock so
+	 *  every pi process coordinates on a single usage request per window. */
+	usageFetch: Record<string, UsageFetchLease>;
 }
 
 export interface RotatorStateStoreOptions {
@@ -166,6 +177,7 @@ export function emptyRotatorState(): RotatorState {
 		identity: {},
 		failures: {},
 		usage: {},
+		usageFetch: {},
 	};
 }
 
@@ -290,6 +302,13 @@ function sanitizeState(raw: Record<string, unknown>): RotatorState {
 		}
 	}
 
+	if (isRecord(raw.usageFetch)) {
+		for (const [profileId, value] of Object.entries(raw.usageFetch)) {
+			const entry = sanitizeUsageFetchLease(value);
+			if (entry !== undefined) state.usageFetch[profileId] = entry;
+		}
+	}
+
 	return state;
 }
 
@@ -348,6 +367,22 @@ function sanitizeUsageError(value: unknown): ProfileUsageError | undefined {
 	const httpStatus = value.httpStatus;
 	if (typeof httpStatus === "number" && Number.isFinite(httpStatus)) error.httpStatus = httpStatus;
 	return error;
+}
+
+/** Keep only finite non-negative timestamps; drop an entry that carries neither,
+ *  so a stray `{}` never occupies a profile slot. */
+function sanitizeUsageFetchLease(value: unknown): UsageFetchLease | undefined {
+	if (!isRecord(value)) return undefined;
+	const entry: UsageFetchLease = {};
+	const leaseUntilMs = value.leaseUntilMs;
+	if (typeof leaseUntilMs === "number" && Number.isFinite(leaseUntilMs) && leaseUntilMs >= 0) {
+		entry.leaseUntilMs = leaseUntilMs;
+	}
+	const backoffUntilMs = value.backoffUntilMs;
+	if (typeof backoffUntilMs === "number" && Number.isFinite(backoffUntilMs) && backoffUntilMs >= 0) {
+		entry.backoffUntilMs = backoffUntilMs;
+	}
+	return entry.leaseUntilMs === undefined && entry.backoffUntilMs === undefined ? undefined : entry;
 }
 
 export class RotatorStateStore {

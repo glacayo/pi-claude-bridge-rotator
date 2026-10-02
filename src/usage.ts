@@ -70,7 +70,7 @@ export interface UsageSnapshot {
 
 export type UsageFetchResult =
 	| { ok: true; snapshot: UsageSnapshot }
-	| { ok: false; reason: UsageFailureReason; httpStatus?: number };
+	| { ok: false; reason: UsageFailureReason; httpStatus?: number; retryAfterMs?: number };
 
 /** Minimal read seam; defaults to `readFileSync(path, "utf8")`. */
 export type ReadFile = (path: string) => string;
@@ -80,6 +80,9 @@ export type ReadFile = (path: string) => string;
 export type FetchUsageResponse = {
 	status: number;
 	json(): Promise<unknown>;
+	/** Optional header seam. The real `Response.headers` (a `Headers`) satisfies
+	 *  it structurally; injected test responses may omit it. */
+	headers?: { get(name: string): string | null } | undefined;
 };
 export type FetchUsageImpl = (
 	url: string,
@@ -89,6 +92,32 @@ export type FetchUsageImpl = (
 export type ReadOAuthAccessTokenResult =
 	| { ok: true; accessToken: string; expiresAtMs?: number }
 	| { ok: false; reason: "no-credentials" };
+
+/**
+ * Parse a `Retry-After` header value into a millisecond delay from `nowMs`.
+ *
+ * Accepts the two RFC 9110 forms: a non-negative integer delta-seconds
+ * (`"120"`) or an HTTP-date (`"Wed, 21 Oct 2015 07:28:00 GMT"`). Anything
+ * else -- absent, empty, non-numeric, or an unparseable date -- yields
+ * `undefined`. A date already in the past clamps to `0`.
+ */
+export function parseRetryAfterMs(value: string | null | undefined, nowMs: number): number | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	if (trimmed.length === 0) return undefined;
+	if (/^\d+$/.test(trimmed)) {
+		const seconds = Number(trimmed);
+		return Number.isFinite(seconds) ? seconds * 1000 : undefined;
+	}
+	// An HTTP-date always contains an ASCII letter (e.g. "Wed, 21 Oct 2015
+	// 07:28:00 GMT"). A purely numeric-ish string like "-5" or "1.5" is an
+	// invalid delta-seconds, not a date, so `Date.parse` must not see it (it is
+	// lenient enough to accept such strings).
+	if (!/[A-Za-z]/.test(trimmed)) return undefined;
+	const parsed = Date.parse(trimmed);
+	if (!Number.isFinite(parsed)) return undefined;
+	return Math.max(0, parsed - nowMs);
+}
 
 export interface ReadOAuthAccessTokenOptions {
 	readFile?: ReadFile | undefined;
@@ -241,7 +270,17 @@ export async function fetchPlanUsage(options: FetchPlanUsageOptions): Promise<Us
 		});
 		if (response.status === 401 || response.status === 403) return { ok: false, reason: "unauthorized" };
 		if (response.status < 200 || response.status >= 300) {
-			return { ok: false, reason: "http-error", httpStatus: response.status };
+			const failure: { ok: false; reason: "http-error"; httpStatus: number; retryAfterMs?: number } = {
+				ok: false,
+				reason: "http-error",
+				httpStatus: response.status,
+			};
+			// Only 429 is a rate limit we back off from; other statuses ignore it.
+			if (response.status === 429) {
+				const retryAfterMs = parseRetryAfterMs(response.headers?.get("retry-after"), nowMs);
+				if (retryAfterMs !== undefined) failure.retryAfterMs = retryAfterMs;
+			}
+			return failure;
 		}
 		let body: unknown;
 		try {

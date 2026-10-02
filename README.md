@@ -122,6 +122,11 @@ right below its cooldown:
   window that has not opened yet renders as `5h 0% (window not started)`.
 - Every profile is polled in parallel with a 5-second timeout, so `status`
   stays a single round trip even with several accounts.
+- Usage is fetched at most about once per account every 4 minutes across all pi
+  processes: a successful poll is reused by every process for that window, and
+  only one process may fetch a given account at a time. If the usage endpoint
+  answers HTTP 429, fetching pauses for that account (honoring `Retry-After`, at
+  least 5 minutes) while the last known snapshot keeps being used.
 - When a poll fails, the line reads `usage: unavailable — <reason>` and, if a
   previous snapshot exists, a second `last known <age> ago: …` line shows how
   fresh that data is.
@@ -162,6 +167,10 @@ probe (15 s) to refresh, then polls once more.
   every 5 minutes, plus once more after a successful request (at most once per
   account per minute). Routing itself reads only the cached snapshot: `acquire`
   is synchronous and never fetches, so a slow endpoint can never stall a turn.
+  Processes coordinate through the shared state file, so the poller and `status`
+  together issue at most about one usage request per account every 4 minutes
+  across every open pi window, and a 429 pauses that account for at least 5
+  minutes.
 - **Cache-aware session affinity**: a session normally stays on its account so
   Claude Code `--resume` keeps working (the bridge needs the exact `configDir`).
   Because prompt caches are isolated per organization and Claude Code uses a
@@ -212,6 +221,10 @@ per profile.
 - **`usage: unavailable — usage endpoint returned HTTP <n>`** — the usage
   endpoint answered with an unexpected status; retry, and check Anthropic
   status if it keeps failing.
+- **`usage: unavailable — usage endpoint rate limited, retrying in <duration>`**
+  — the usage endpoint answered HTTP 429 for that account, so fetching is paused
+  for the shown time (at least 5 minutes, following `Retry-After`) and the last
+  known snapshot keeps being shown. No action is needed; it resumes on its own.
 - **`usage: unavailable — network error`** — the request could not reach the
   endpoint. Check connectivity.
 - **`usage: unavailable — timed out after 5s`** — the endpoint did not answer
