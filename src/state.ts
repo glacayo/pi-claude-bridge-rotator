@@ -74,6 +74,10 @@ export interface RotatorState {
 	invalid: string[];
 	/** Insertion order is recency: see `touchSessionAffinity`. */
 	sessionAffinity: Record<string, string>;
+	/** Epoch ms of each bound session's last successful use, keyed by session id.
+	 *  Kept in lockstep with `sessionAffinity` (same keys, same cap) so the
+	 *  cache-aware move rule can tell whether a 1-hour prompt cache is cold. */
+	sessionLastUsedAtMs: Record<string, number>;
 	cursor: number;
 	identity: Record<string, ProfileIdentity>;
 	failures: Record<string, ProfileFailure>;
@@ -127,6 +131,7 @@ export function emptyRotatorState(): RotatorState {
 		cooldowns: {},
 		invalid: [],
 		sessionAffinity: {},
+		sessionLastUsedAtMs: {},
 		cursor: 0,
 		identity: {},
 		failures: {},
@@ -134,26 +139,46 @@ export function emptyRotatorState(): RotatorState {
 	};
 }
 
-/** Keep affinity ordered by recency: delete first so a re-set appends. */
+/** Keep affinity ordered by recency: delete first so a re-set appends. When a
+ *  `lastUsedAtMs` map is given it is written in the same step and pruned with
+ *  the same boundary, so the two maps never disagree about which sessions are
+ *  bound. `atMs` defaults to `Date.now()` only for callers without an injected
+ *  clock; the router always passes its `now`. */
 export function touchSessionAffinity(
 	affinity: Record<string, string>,
 	sessionId: string,
 	profileId: string,
 	limit: number = MAX_SESSION_AFFINITY_ENTRIES,
+	lastUsedAtMs?: Record<string, number> | undefined,
+	atMs?: number | undefined,
 ): void {
 	delete affinity[sessionId];
 	affinity[sessionId] = profileId;
-	pruneSessionAffinity(affinity, limit);
+	if (lastUsedAtMs !== undefined) {
+		delete lastUsedAtMs[sessionId];
+		lastUsedAtMs[sessionId] = atMs ?? Date.now();
+	}
+	pruneSessionAffinity(affinity, limit, lastUsedAtMs);
 }
 
+/** Drop the oldest affinity entries past `limit`; when a paired `lastUsedAtMs`
+ *  map is given, its entries are evicted together and any orphan it still holds
+ *  (a timestamp with no affinity) is removed. */
 export function pruneSessionAffinity(
 	affinity: Record<string, string>,
 	limit: number = MAX_SESSION_AFFINITY_ENTRIES,
+	lastUsedAtMs?: Record<string, number> | undefined,
 ): void {
 	const keys = Object.keys(affinity);
 	for (let index = 0; index < keys.length - limit; index += 1) {
 		const key = keys[index];
-		if (key !== undefined) delete affinity[key];
+		if (key === undefined) continue;
+		delete affinity[key];
+		if (lastUsedAtMs !== undefined) delete lastUsedAtMs[key];
+	}
+	if (lastUsedAtMs === undefined) return;
+	for (const sessionId of Object.keys(lastUsedAtMs)) {
+		if (affinity[sessionId] === undefined) delete lastUsedAtMs[sessionId];
 	}
 }
 
@@ -185,6 +210,16 @@ function sanitizeState(raw: Record<string, unknown>): RotatorState {
 			if (sessionId.length > 0 && bound !== undefined) state.sessionAffinity[sessionId] = bound;
 		}
 		pruneSessionAffinity(state.sessionAffinity);
+	}
+
+	// Last-use timestamps are optional (old files omit them) and valid only for
+	// a session that still has affinity: finite, non-negative, no orphans.
+	if (isRecord(raw.sessionLastUsedAtMs)) {
+		for (const [sessionId, value] of Object.entries(raw.sessionLastUsedAtMs)) {
+			if (state.sessionAffinity[sessionId] === undefined) continue;
+			if (typeof value !== "number" || !Number.isFinite(value) || value < 0) continue;
+			state.sessionLastUsedAtMs[sessionId] = value;
+		}
 	}
 
 	const cursor = raw.cursor;

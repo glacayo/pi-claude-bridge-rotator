@@ -14,7 +14,7 @@
 // a cooldown.
 
 import type { RotatorConfig, RotatorProfileConfig } from "./config.js";
-import { rankProfiles } from "./ranking.js";
+import { decideAffinity, NEW_SESSION_PENALTY, rankProfiles } from "./ranking.js";
 import { cloneJsonValue, MAX_SESSION_AFFINITY_ENTRIES, RotatorStateStore, touchSessionAffinity } from "./state.js";
 import type { JsonValue, ProfileUsageError, ProfileUsageRecord } from "./state.js";
 import type { UsageFetchResult } from "./usage.js";
@@ -144,6 +144,10 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 	private readonly onRequestSucceeded: ((profileId: string) => void) | undefined;
 	private readonly lastRouteBySession = new Map<string, ClaudeAccountRoute>();
 	private readonly maxSessionRouteEntries: number;
+	/** New (non-affinity) sessions routed to each profile since that profile's
+	 *  current snapshot, keyed by `fetchedAtMs` so a newer snapshot resets the
+	 *  count. In-memory only; a restart just starts the spread over. */
+	private readonly newSessionsSinceSnapshot = new Map<string, { fetchedAtMs: number; count: number }>();
 	private lastGlobalRoute: ClaudeAccountRoute | undefined;
 	private warnedOnce = false;
 
@@ -164,15 +168,12 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 		const nowMs = this.now();
 		const excluded = new Set((input.excludedProfileIds ?? []).filter((id) => typeof id === "string"));
 		const sessionId = nonEmptyString(input.sessionId);
+		const bound = sessionId === undefined ? undefined : this.state.state.sessionAffinity[sessionId];
+		// A session counts as "new" for the spread penalty only when it has no
+		// affinity at all: a forced move off an ineligible account is not new.
+		const isNewSession = bound === undefined;
 
-		// Affinity first: a bound session keeps its account so Claude Code
-		// `--resume` keeps finding the JSONL it wrote under that config dir.
-		if (sessionId !== undefined) {
-			const bound = this.state.state.sessionAffinity[sessionId];
-			if (bound !== undefined && this.isEligible(bound, excluded, nowMs)) return this.issue(bound, sessionId);
-		}
-
-		// Collect eligible candidates in profile order, then rank them. Ranking is
+		// Collect eligible candidates once, in profile order. Ranking is
 		// deterministic and reads only the cached snapshot (`acquire` never
 		// fetches). With no fresh snapshot at all it degrades to today's cursor
 		// round-robin.
@@ -180,7 +181,32 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 		for (const profile of this.profileList) {
 			if (this.isEligible(profile.id, excluded, nowMs)) candidates.push(profile.id);
 		}
-		const ranked = rankProfiles({ candidates, usage: (id) => this.planUsage(id), nowMs });
+
+		// Affinity first: a bound session keeps its account so Claude Code
+		// `--resume` keeps finding the JSONL it wrote under that config dir. It
+		// may still move for the cache-aware reasons below (hard cap, or soft cap
+		// with a cold cache). An eligibility failure falls through unchanged.
+		if (sessionId !== undefined && bound !== undefined && this.isEligible(bound, excluded, nowMs)) {
+			const decision = decideAffinity({
+				bound,
+				candidates,
+				usage: (id) => this.planUsage(id),
+				nowMs,
+				lastUsedAtMs: this.state.state.sessionLastUsedAtMs[sessionId],
+			});
+			if (!decision.moved) return this.issue(bound, sessionId);
+			// A move behaves like a normal ranked pick: advance past it and issue
+			// the new route, which rebinds the session's in-memory route.
+			this.advanceCursor(this.profileIndexAfter(decision.profileId));
+			return this.issue(decision.profileId, sessionId);
+		}
+
+		const ranked = rankProfiles({
+			candidates,
+			usage: (id) => this.planUsage(id),
+			nowMs,
+			penalty: (id) => this.newSessionPenalty(id),
+		});
 
 		if (ranked.mode === "usage") {
 			// Usage mode always yields a non-empty order when at least one profile
@@ -188,8 +214,8 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 			// round-robin stays fair.
 			const picked = ranked.order[0];
 			if (picked !== undefined) {
-				const index = this.profileList.findIndex((profile) => profile.id === picked);
-				this.advanceCursor(index + 1);
+				this.advanceCursor(this.profileIndexAfter(picked));
+				if (isNewSession) this.countNewSession(picked);
 				return this.issue(picked, sessionId);
 			}
 		} else {
@@ -204,6 +230,7 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 				if (candidate === undefined) continue;
 				if (!this.isEligible(candidate.id, excluded, nowMs)) continue;
 				this.advanceCursor(index + 1);
+				if (isNewSession) this.countNewSession(candidate.id);
 				return this.issue(candidate.id, sessionId);
 			}
 		}
@@ -274,8 +301,16 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 			this.invokeRequestSucceeded(profileId);
 			const sid = nonEmptyString(sessionId);
 			if (sid === undefined) return;
+			const atMs = this.now();
 			this.state.update((state) => {
-				touchSessionAffinity(state.sessionAffinity, sid, profileId);
+				touchSessionAffinity(
+					state.sessionAffinity,
+					sid,
+					profileId,
+					MAX_SESSION_AFFINITY_ENTRIES,
+					state.sessionLastUsedAtMs,
+					atMs,
+				);
 			});
 		});
 	}
@@ -400,6 +435,34 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 		if (length === 0) return 0;
 		const stored = this.state.state.cursor;
 		return Number.isSafeInteger(stored) && stored >= 0 ? stored % length : 0;
+	}
+
+	/** Cursor value that points just past `profileId` (the index of the pick plus
+	 *  one); if the id left the config the cursor simply wraps to the start. */
+	private profileIndexAfter(profileId: string): number {
+		return this.profileList.findIndex((profile) => profile.id === profileId) + 1;
+	}
+
+	/** In-memory herd penalty for `profileId`: points for each new session routed
+	 *  to it since its current snapshot. A newer snapshot (different
+	 *  `fetchedAtMs`) resets the count, and a missing snapshot is no penalty. */
+	private newSessionPenalty(profileId: string): number {
+		const entry = this.newSessionsSinceSnapshot.get(profileId);
+		if (entry === undefined) return 0;
+		const snapshot = this.planUsage(profileId)?.snapshot;
+		if (snapshot === undefined || snapshot.fetchedAtMs !== entry.fetchedAtMs) return 0;
+		return entry.count * NEW_SESSION_PENALTY;
+	}
+
+	private countNewSession(profileId: string): void {
+		const snapshot = this.planUsage(profileId)?.snapshot;
+		if (snapshot === undefined) return;
+		const entry = this.newSessionsSinceSnapshot.get(profileId);
+		if (entry === undefined || entry.fetchedAtMs !== snapshot.fetchedAtMs) {
+			this.newSessionsSinceSnapshot.set(profileId, { fetchedAtMs: snapshot.fetchedAtMs, count: 1 });
+			return;
+		}
+		entry.count += 1;
 	}
 
 	private advanceCursor(value: number): void {

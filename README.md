@@ -149,6 +149,12 @@ probe (15 s) to refresh, then polls once more.
   treated as unknown and placed between the healthy and the capped ones. Ties
   keep the configured profile order, so the choice is fully deterministic:
   the same inputs always produce the same route.
+- **Per-session spread between refreshes**: ranking alone would send every new
+  session to the same best account until the next snapshot. Each new
+  (non-affinity) session routed to a profile adds a small in-memory score
+  penalty to that profile, so new sessions spread across the healthy accounts.
+  The count resets as soon as a newer snapshot arrives, never applies in
+  round-robin mode, and never overrides the hard caps.
 - **Round-robin fallback**: until the first snapshot arrives (or when every
   snapshot is stale), ranking degrades to the cursor round-robin over the
   eligible profiles, so rotation is never worse than it was before.
@@ -156,10 +162,18 @@ probe (15 s) to refresh, then polls once more.
   every 5 minutes, plus once more after a successful request (at most once per
   account per minute). Routing itself reads only the cached snapshot: `acquire`
   is synchronous and never fetches, so a slow endpoint can never stall a turn.
-- **Session affinity is unchanged in this stage**: within a session, requests
-  stick to its profile so Claude Code `--resume` keeps working (the bridge needs
-  the exact `configDir`). Moving a bound session between accounts is the next
-  stage.
+- **Cache-aware session affinity**: a session normally stays on its account so
+  Claude Code `--resume` keeps working (the bridge needs the exact `configDir`).
+  Because prompt caches are isolated per organization and Claude Code uses a
+  1-hour cache TTL, moving a session always costs one cold cache rebuild, so the
+  router moves it only when the move is worth that cost: when the bound account
+  is ineligible (cooling down, invalid, or excluded); when it is at a hard cap
+  (5-hour ≥ 95 % or weekly ≥ 98 %) and another eligible account is not; or when
+  it is over a soft threshold (5-hour ≥ 85 % or weekly ≥ 90 %) **and** the
+  session has been idle for at least 1 hour, so its cache is already cold. An
+  unknown last-use time counts as still warm, so the session stays. A move
+  behaves like a normal ranked pick and rebinds the session; staying does not
+  disturb the round-robin cursor.
 - **Cooldowns**: a rate-limited account stops receiving traffic until the
   upstream reset time (or a 30-minute default when the payload carries no
   reset); all traffic goes to the remaining account(s). The bridge's retry loop
@@ -170,9 +184,10 @@ probe (15 s) to refresh, then polls once more.
   reset time, which the bridge surfaces as a clear error.
 
 State lives in `~/.pi/agent/claude-bridge-rotator-state.json` (0600, atomic
-writes): cooldowns, invalid set, session affinity (pruned to the last 200
-sessions), a cached identity per profile, and a normalized plan-usage snapshot
-(plus the last failure reason) per profile.
+writes): cooldowns, invalid set, session affinity and its paired last-use
+timestamps (pruned together to the last 200 sessions), a cached identity per
+profile, and a normalized plan-usage snapshot (plus the last failure reason)
+per profile.
 
 ## Troubleshooting
 

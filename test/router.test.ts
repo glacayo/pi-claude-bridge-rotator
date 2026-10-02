@@ -16,6 +16,7 @@ import {
 	resetTimestampMs,
 } from "../src/router.js";
 import type { ClaudeAccountAcquireInput, ClaudeAccountFailureKind, ClaudeAccountRouterV1 } from "../src/router.js";
+import type { UsageFetchResult } from "../src/usage.js";
 
 afterEach(cleanupTempDirs);
 
@@ -463,6 +464,19 @@ describe("session reporting and profile resolution", () => {
 		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
 	});
 
+	it("writes the paired last-use timestamp with the injected clock", () => {
+		const { router, store, advance } = harness([profile("a")]);
+
+		router.recordSuccess("a", "s1");
+		expect(store.state.sessionLastUsedAtMs.s1).toBe(START_MS);
+
+		advance(5 * MINUTE_MS);
+		router.recordSuccess("a", "s1");
+
+		expect(store.state.sessionLastUsedAtMs.s1).toBe(START_MS + 5 * MINUTE_MS);
+		expect(Object.keys(store.state.sessionLastUsedAtMs)).toEqual(["s1"]);
+	});
+
 	it("ignores recordSuccess without a session id", () => {
 		const { router, store } = harness([profile("a")]);
 
@@ -748,6 +762,143 @@ describe("usage-aware ranking", () => {
 			reason: "automatic-failover",
 		});
 		expect(failover.profileId).toBe("c");
+	});
+});
+
+describe("cache-aware affinity", () => {
+	const DAY_MS = 24 * HOUR_MS;
+
+	function freshAt(fetchedAtMs: number, weeklyUtil: number, fiveHourUtil = 0): UsageFetchResult {
+		return {
+			ok: true,
+			snapshot: {
+				fetchedAtMs,
+				windows: {
+					five_hour: { utilization: fiveHourUtil, resetsAtMs: null },
+					seven_day: { utilization: weeklyUtil, resetsAtMs: fetchedAtMs + 3 * DAY_MS },
+				},
+			},
+		};
+	}
+
+	it("keeps a bound session under both soft thresholds and does not advance the cursor", () => {
+		const { router, store } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", freshAt(START_MS, 20));
+		router.recordPlanUsage("b", freshAt(START_MS, 0));
+		router.recordSuccess("a", "s1");
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("a");
+		expect(store.state.cursor).toBe(0);
+	});
+
+	it("moves a bound session at the hard cap to the best non-capped profile and advances the cursor", () => {
+		const { router, store } = harness([profile("a"), profile("b"), profile("c")]);
+		router.recordPlanUsage("a", freshAt(START_MS, 0, 96));
+		router.recordPlanUsage("b", freshAt(START_MS, 10));
+		router.recordPlanUsage("c", freshAt(START_MS, 40));
+		router.recordSuccess("a", "s1");
+
+		const route = router.acquire({ modelId: "m", sessionId: "s1" });
+
+		expect(route.profileId).toBe("b");
+		// The move behaves like a ranked pick: the cursor lands past "b".
+		expect(store.state.cursor).toBe(2);
+		router.recordSuccess(route.profileId, "s1");
+		expect(store.state.sessionAffinity.s1).toBe("b");
+	});
+
+	it("moves over a soft threshold only after the 1-hour cache has gone cold", () => {
+		const { router, store, now, advance } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", freshAt(START_MS, 0, 90));
+		router.recordPlanUsage("b", freshAt(START_MS, 0));
+		router.recordSuccess("a", "s1");
+
+		// Warm cache: the session stays even though the account is over soft.
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("a");
+
+		// After an hour idle the poller has refreshed both snapshots; the cache is
+		// cold, so the move is free.
+		advance(60 * MINUTE_MS);
+		router.recordPlanUsage("a", freshAt(now(), 0, 90));
+		router.recordPlanUsage("b", freshAt(now(), 0));
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
+		router.recordSuccess("b", "s1");
+		expect(store.state.sessionAffinity.s1).toBe("b");
+	});
+
+	it("still bypasses affinity when the bound profile is ineligible, even under soft", () => {
+		const { router, now } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", freshAt(START_MS, 0, 10));
+		router.recordPlanUsage("b", freshAt(START_MS, 0));
+		router.recordSuccess("a", "s1");
+		router.recordRateLimit("a", { resetsAt: (now() + HOUR_MS) / 1000 }, "m");
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
+	});
+});
+
+describe("new-session spread penalty", () => {
+	const DAY_MS = 24 * HOUR_MS;
+
+	function frozen(fetchedAtMs: number, weeklyUtil: number, fiveHourUtil = 0, resetsBaseMs = fetchedAtMs): UsageFetchResult {
+		return {
+			ok: true,
+			snapshot: {
+				fetchedAtMs,
+				windows: {
+					five_hour: { utilization: fiveHourUtil, resetsAtMs: null },
+					seven_day: { utilization: weeklyUtil, resetsAtMs: resetsBaseMs + 3 * DAY_MS },
+				},
+			},
+		};
+	}
+
+	it("spreads new sessions across equally ranked accounts deterministically", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", frozen(START_MS, 0));
+		router.recordPlanUsage("b", frozen(START_MS, 0));
+
+		const ids = ["s1", "s2", "s3", "s4"].map(
+			(sessionId) => router.acquire({ modelId: "m", sessionId }).profileId,
+		);
+
+		expect(ids).toEqual(["a", "b", "a", "b"]);
+	});
+
+	it("resets the spread once a newer snapshot arrives", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", frozen(START_MS, 0));
+		router.recordPlanUsage("b", frozen(START_MS, 0));
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("a");
+
+		// A fresh snapshot for "a" (same windows, newer `fetchedAtMs`) resets its
+		// count, so the next tie favors it again.
+		router.recordPlanUsage("a", frozen(START_MS + 1, 0, 0, START_MS));
+
+		expect(router.acquire({ modelId: "m", sessionId: "s2" }).profileId).toBe("a");
+	});
+
+	it("never lets the penalty override a hard cap", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", frozen(START_MS, 0));
+		router.recordPlanUsage("b", frozen(START_MS, 0, 96));
+
+		const ids = ["s1", "s2", "s3"].map(
+			(sessionId) => router.acquire({ modelId: "m", sessionId }).profileId,
+		);
+
+		expect(ids).toEqual(["a", "a", "a"]);
+	});
+
+	it("has no effect in round-robin mode", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+
+		const ids = ["s1", "s2", "s3", "s4"].map(
+			(sessionId) => router.acquire({ modelId: "m", sessionId }).profileId,
+		);
+
+		expect(ids).toEqual(["a", "b", "a", "b"]);
 	});
 });
 

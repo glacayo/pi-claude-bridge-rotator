@@ -17,6 +17,8 @@ import activate, { createRotatorCommandHandler } from "../src/index.js";
 
 const COMMAND_STATE_SYMBOL = Symbol.for("pi-claude-bridge-rotator:commandState");
 
+const flush = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
 function commandState(target: GlobalTarget): RotatorCommandState {
 	return target[COMMAND_STATE_SYMBOL] as RotatorCommandState;
 }
@@ -341,6 +343,42 @@ describe("usage poller lifecycle", () => {
 
 		expect(commandState(target).poller).toBeUndefined();
 		expect(timers.timers.intervals).toBe(0);
+	});
+});
+
+describe("after-request refresh wiring", () => {
+	it("triggers poller.requestRefresh(profileId) when the published router records a success", async () => {
+		const { pi, handlers } = makeFakePi();
+		const target: GlobalTarget = {};
+		const agent = makeAgentDir(true);
+		const timers = timerSpy();
+		const configDirs: string[] = [];
+
+		activateExtension(pi, {
+			globalTarget: target,
+			env: agent.env,
+			...timers,
+			fetchUsage: async ({ configDir }) => {
+				configDirs.push(configDir);
+				return { ok: true, snapshot: { fetchedAtMs: 1, windows: {} } };
+			},
+		});
+
+		// SAFETY: the symbol holds the router this activation just published.
+		const router = target[CLAUDE_ACCOUNT_ROUTER_SYMBOL] as unknown as {
+			recordSuccess(profileId: string, sessionId?: string): void;
+		};
+
+		// No poller exists before `session_start`, so the trigger is a no-op.
+		router.recordSuccess("a", "s1");
+		await flush();
+		expect(configDirs).toEqual([]);
+
+		dispatch(handlers, "session_start", {}, { ui: { notify: () => {} } });
+		router.recordSuccess("a", "s1");
+		await flush();
+
+		expect(configDirs).toEqual([join(agent.dir, "acc-a")]);
 	});
 });
 

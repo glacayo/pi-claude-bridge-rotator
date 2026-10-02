@@ -81,7 +81,9 @@ export class UsagePoller {
 	 *  discarded instead of recorded. */
 	private generation = 0;
 	private timerHandles: unknown[] = [];
-	private readonly inFlight = new Set<string>();
+	/** Profile id -> the generation that started its in-flight refresh, so a
+	 *  result from before `stop()` can be told apart from a restarted one. */
+	private readonly inFlight = new Map<string, number>();
 	private readonly lastRefreshAtMs = new Map<string, number>();
 	private readonly warnedKinds = new Set<string>();
 
@@ -120,12 +122,15 @@ export class UsagePoller {
 		this.timerHandles = [immediate, interval];
 	}
 
-	/** Idempotent: clears every timer and discards in-flight results. */
+	/** Idempotent: clears every timer and discards in-flight results. Clears the
+	 *  in-flight set too, so a restart is not blocked by a fetch that never
+	 *  resolved (its late result is still discarded by the generation bump). */
 	stop(): void {
 		this.running = false;
 		this.generation += 1;
 		for (const handle of this.timerHandles) this.clearIntervalFn(handle);
 		this.timerHandles = [];
+		this.inFlight.clear();
 	}
 
 	/** Refresh one profile off the normal cadence. Throttled per profile and
@@ -173,16 +178,16 @@ export class UsagePoller {
 		generation: number,
 	): Promise<void> {
 		if (this.inFlight.has(profile.id)) return;
-		this.inFlight.add(profile.id);
+		this.inFlight.set(profile.id, generation);
 		let result: UsageFetchResult;
 		try {
 			result = await this.fetchUsage({ configDir: profile.configDir });
 		} catch (error) {
-			this.inFlight.delete(profile.id);
+			if (this.inFlight.get(profile.id) === generation) this.inFlight.delete(profile.id);
 			this.warnOnce("fetch-error", `usage refresh failed: ${describeError(error)}`);
 			return;
 		}
-		this.inFlight.delete(profile.id);
+		if (this.inFlight.get(profile.id) === generation) this.inFlight.delete(profile.id);
 		if (!this.running || generation !== this.generation) return;
 		if (!result.ok) this.warnOnce(result.reason, `usage refresh failed (${result.reason}).`);
 		try {

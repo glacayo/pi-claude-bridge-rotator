@@ -94,14 +94,25 @@ export type {
 } from "./commands.js";
 
 export {
+	CACHE_COLD_IDLE_MS,
+	decideAffinity,
 	FIVE_HOUR_BONUS_WINDOW_MS,
 	FIVE_HOUR_HARD_CAP,
+	FIVE_HOUR_SOFT_CAP,
+	NEW_SESSION_PENALTY,
 	rankProfiles,
 	SNAPSHOT_MAX_AGE_MS,
 	WEEK_MS,
 	WEEKLY_HARD_CAP,
+	WEEKLY_SOFT_CAP,
 } from "./ranking.js";
-export type { RankedProfiles, RankProfilesInput, RankingMode } from "./ranking.js";
+export type {
+	AffinityDecision,
+	DecideAffinityInput,
+	RankedProfiles,
+	RankProfilesInput,
+	RankingMode,
+} from "./ranking.js";
 
 export {
 	UsagePoller,

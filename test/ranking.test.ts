@@ -3,11 +3,15 @@
 
 import { describe, expect, it } from "vitest";
 import {
+	CACHE_COLD_IDLE_MS,
+	decideAffinity,
 	FIVE_HOUR_BONUS_WINDOW_MS,
 	FIVE_HOUR_HARD_CAP,
+	FIVE_HOUR_SOFT_CAP,
 	SNAPSHOT_MAX_AGE_MS,
 	WEEK_MS,
 	WEEKLY_HARD_CAP,
+	WEEKLY_SOFT_CAP,
 	rankProfiles,
 } from "../src/ranking.js";
 import type { ProfileUsageRecord } from "../src/state.js";
@@ -251,5 +255,179 @@ describe("determinism and ties", () => {
 		const first = rankProfiles({ candidates: ["a", "b", "c"], usage: (id) => records[id as keyof typeof records], nowMs: NOW });
 		const second = rankProfiles({ candidates: ["a", "b", "c"], usage: (id) => records[id as keyof typeof records], nowMs: NOW });
 		expect(second).toEqual(first);
+	});
+});
+
+describe("herd penalty", () => {
+	it("subtracts the penalty from known scores and can flip the order", () => {
+		const records: Record<string, ProfileUsageRecord | undefined> = {
+			a: record(midWeek(0, 0)),
+			b: record(midWeek(0, 10)),
+		};
+		// Without a penalty, the lower weekly use wins.
+		expect(rank(["a", "b"], records).order).toEqual(["a", "b"]);
+
+		const penalized = rankProfiles({
+			candidates: ["a", "b"],
+			usage: (id) => records[id],
+			nowMs: NOW,
+			penalty: (id) => (id === "a" ? 50 : 0),
+		});
+
+		expect(penalized.order).toEqual(["b", "a"]);
+	});
+
+	it("never promotes a capped profile over an uncapped one", () => {
+		const records: Record<string, ProfileUsageRecord | undefined> = {
+			a: record(midWeek(0, 0)),
+			b: record(midWeek(0, WEEKLY_HARD_CAP)),
+		};
+
+		const result = rankProfiles({
+			candidates: ["a", "b"],
+			usage: (id) => records[id],
+			nowMs: NOW,
+			penalty: (id) => (id === "a" ? 1_000 : 0),
+		});
+
+		expect(result.order).toEqual(["a", "b"]);
+	});
+
+	it("is ignored in round-robin mode", () => {
+		const result = rankProfiles({
+			candidates: ["a", "b"],
+			usage: () => undefined,
+			nowMs: NOW,
+			penalty: () => 100,
+		});
+
+		expect(result).toEqual({ order: ["a", "b"], mode: "round-robin" });
+	});
+
+	it("treats a non-finite penalty as zero", () => {
+		const records: Record<string, ProfileUsageRecord | undefined> = {
+			a: record(midWeek(0, 0)),
+			b: record(midWeek(0, 10)),
+		};
+
+		const result = rankProfiles({
+			candidates: ["a", "b"],
+			usage: (id) => records[id],
+			nowMs: NOW,
+			penalty: () => Number.NaN,
+		});
+
+		expect(result.order).toEqual(["a", "b"]);
+	});
+});
+
+describe("decideAffinity", () => {
+	function decide(
+		bound: string,
+		candidates: string[],
+		records: Record<string, ProfileUsageRecord | undefined>,
+		lastUsedAtMs?: number | undefined,
+		nowMs = NOW,
+	): { profileId: string; moved: boolean } {
+		return decideAffinity({ bound, candidates, usage: (id) => records[id], nowMs, lastUsedAtMs });
+	}
+
+	it("keeps the bound profile when nothing is known (round-robin)", () => {
+		expect(decide("a", ["a", "b"], {})).toEqual({ profileId: "a", moved: false });
+	});
+
+	it("keeps the bound profile when its snapshot is stale", () => {
+		const stale = record(snapshot(NOW - SNAPSHOT_MAX_AGE_MS - 1, {
+			fiveHour: { utilization: 90, resetsInMs: null },
+			weekly: { utilization: 0, resetsInMs: 3 * DAY_MS },
+		}));
+		const records = { a: stale, b: record(midWeek(0, 0)) };
+
+		expect(decide("a", ["a", "b"], records, NOW - CACHE_COLD_IDLE_MS)).toEqual({ profileId: "a", moved: false });
+	});
+
+	it("keeps the bound profile under both soft thresholds", () => {
+		const records = { a: record(midWeek(10, 20)), b: record(midWeek(0, 0)) };
+
+		expect(decide("a", ["a", "b"], records, NOW - CACHE_COLD_IDLE_MS)).toEqual({ profileId: "a", moved: false });
+	});
+
+	it("keeps the bound profile over a soft threshold when the cache is warm", () => {
+		const records = { a: record(midWeek(0, 90)), b: record(midWeek(0, 0)) };
+
+		expect(decide("a", ["a", "b"], records, NOW - (CACHE_COLD_IDLE_MS - 1)))
+			.toEqual({ profileId: "a", moved: false });
+	});
+
+	it("keeps the bound profile over a soft threshold when the last use is unknown", () => {
+		const records = { a: record(midWeek(0, 90)), b: record(midWeek(0, 0)) };
+
+		expect(decide("a", ["a", "b"], records, undefined)).toEqual({ profileId: "a", moved: false });
+	});
+
+	it("keeps the bound profile over a soft threshold when the top alternative is also over it", () => {
+		const records = { a: record(midWeek(90, 0)), b: record(midWeek(85, 0)) };
+
+		expect(decide("a", ["a", "b"], records, NOW - CACHE_COLD_IDLE_MS))
+			.toEqual({ profileId: "a", moved: false });
+	});
+
+	it("moves off a hard-capped account to a non-capped one without waiting for idle", () => {
+		const fiveHour = { a: record(midWeek(FIVE_HOUR_HARD_CAP, 0)), b: record(midWeek(0, 0)) };
+		const weekly = { a: record(midWeek(0, WEEKLY_HARD_CAP)), b: record(midWeek(0, 0)) };
+
+		expect(decide("a", ["a", "b"], fiveHour, undefined)).toEqual({ profileId: "b", moved: true });
+		expect(decide("a", ["a", "b"], weekly, undefined)).toEqual({ profileId: "b", moved: true });
+	});
+
+	it("stays on a hard cap when every candidate is capped", () => {
+		// Bound is the least-used capped profile -> it is also the ranked best.
+		const records = {
+			a: record(midWeek(FIVE_HOUR_HARD_CAP, 0)),
+			b: record(midWeek(FIVE_HOUR_HARD_CAP + 1, 0)),
+		};
+
+		expect(decide("a", ["a", "b"], records, NOW - CACHE_COLD_IDLE_MS)).toEqual({ profileId: "a", moved: false });
+	});
+
+	it("stays when the ranked best capped profile is not the bound one", () => {
+		const records = {
+			a: record(midWeek(FIVE_HOUR_HARD_CAP + 1, 0)),
+			b: record(midWeek(FIVE_HOUR_HARD_CAP, 0)),
+		};
+
+		expect(decide("a", ["a", "b"], records, NOW - CACHE_COLD_IDLE_MS)).toEqual({ profileId: "a", moved: false });
+	});
+
+	it("moves over a soft threshold when idle and the top alternative is under both softs", () => {
+		const records = { a: record(midWeek(0, 90)), b: record(midWeek(0, 0)) };
+
+		expect(decide("a", ["a", "b"], records, NOW - CACHE_COLD_IDLE_MS))
+			.toEqual({ profileId: "b", moved: true });
+	});
+
+	it("honours the idle boundary at exactly one hour", () => {
+		const records = { a: record(midWeek(0, 90)), b: record(midWeek(0, 0)) };
+
+		expect(decide("a", ["a", "b"], records, NOW - (CACHE_COLD_IDLE_MS - 1)))
+			.toEqual({ profileId: "a", moved: false });
+		expect(decide("a", ["a", "b"], records, NOW - CACHE_COLD_IDLE_MS))
+			.toEqual({ profileId: "b", moved: true });
+	});
+
+	it("honours the soft 5-hour boundary", () => {
+		const under = { a: record(midWeek(FIVE_HOUR_SOFT_CAP - 0.1, 0)), b: record(midWeek(0, 0)) };
+		const at = { a: record(midWeek(FIVE_HOUR_SOFT_CAP, 0)), b: record(midWeek(0, 0)) };
+
+		expect(decide("a", ["a", "b"], under, NOW - CACHE_COLD_IDLE_MS)).toEqual({ profileId: "a", moved: false });
+		expect(decide("a", ["a", "b"], at, NOW - CACHE_COLD_IDLE_MS)).toEqual({ profileId: "b", moved: true });
+	});
+
+	it("honours the soft weekly boundary", () => {
+		const under = { a: record(midWeek(0, WEEKLY_SOFT_CAP - 0.1)), b: record(midWeek(0, 0)) };
+		const at = { a: record(midWeek(0, WEEKLY_SOFT_CAP)), b: record(midWeek(0, 0)) };
+
+		expect(decide("a", ["a", "b"], under, NOW - CACHE_COLD_IDLE_MS)).toEqual({ profileId: "a", moved: false });
+		expect(decide("a", ["a", "b"], at, NOW - CACHE_COLD_IDLE_MS)).toEqual({ profileId: "b", moved: true });
 	});
 });
