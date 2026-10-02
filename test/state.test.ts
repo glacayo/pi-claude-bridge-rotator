@@ -4,6 +4,7 @@ import { basename, join } from "node:path";
 import { cleanupTempDirs, makeTempDir } from "./helpers.js";
 import {
 	MAX_SESSION_AFFINITY_ENTRIES,
+	pruneSessionAffinity,
 	RotatorStateStore,
 	ROTATOR_STATE_FILENAME,
 	STATE_VERSION,
@@ -190,6 +191,108 @@ describe("usage state sanitization", () => {
 		const reloaded = new RotatorStateStore({ statePath });
 
 		expect(reloaded.state.usage.a?.snapshot?.windows.five_hour).toEqual({ utilization: 12, resetsAtMs: 2000 });
+	});
+});
+
+describe("session last-use state", () => {
+	it("defaults the paired last-use map to empty on a fresh state", () => {
+		const dir = makeTempDir();
+		const store = new RotatorStateStore({ statePath: statePathFor(dir) });
+
+		expect(store.state.sessionLastUsedAtMs).toEqual({});
+	});
+
+	it("loads an old file that has affinity but no last-use map", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		writeFileSync(statePath, JSON.stringify({ version: 1, sessionAffinity: { s1: "a" } }));
+
+		const store = new RotatorStateStore({ statePath });
+
+		expect(store.state.sessionAffinity).toEqual({ s1: "a" });
+		expect(store.state.sessionLastUsedAtMs).toEqual({});
+	});
+
+	it("keeps finite non-negative timestamps and drops orphans or malformed values", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		writeFileSync(statePath, JSON.stringify({
+			version: 1,
+			sessionAffinity: { s1: "a", s2: "b" },
+			sessionLastUsedAtMs: {
+				s1: 123,
+				s2: -1,
+				orphan: 5,
+				missingAffinity: 7,
+				notANumber: "x",
+				nullValue: null,
+			},
+		}));
+
+		const store = new RotatorStateStore({ statePath });
+
+		expect(store.state.sessionLastUsedAtMs).toEqual({ s1: 123 });
+	});
+
+	it("round-trips paired affinity and last-use through a reload", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		const store = new RotatorStateStore({ statePath });
+
+		store.update((state) => {
+			touchSessionAffinity(
+				state.sessionAffinity,
+				"s1",
+				"a",
+				MAX_SESSION_AFFINITY_ENTRIES,
+				state.sessionLastUsedAtMs,
+				555,
+			);
+		});
+
+		const reloaded = new RotatorStateStore({ statePath });
+
+		expect(reloaded.state.sessionAffinity.s1).toBe("a");
+		expect(reloaded.state.sessionLastUsedAtMs.s1).toBe(555);
+	});
+
+	it("prunes affinity and last-use together with the same cap and no orphans", () => {
+		const dir = makeTempDir();
+		const store = new RotatorStateStore({ statePath: statePathFor(dir) });
+
+		store.update((state) => {
+			for (let index = 0; index < 205; index += 1) {
+				touchSessionAffinity(
+					state.sessionAffinity,
+					`s${index}`,
+					"a",
+					MAX_SESSION_AFFINITY_ENTRIES,
+					state.sessionLastUsedAtMs,
+					1_000 + index,
+				);
+			}
+		});
+
+		const affinityKeys = Object.keys(store.state.sessionAffinity);
+		const lastUsedKeys = Object.keys(store.state.sessionLastUsedAtMs);
+		expect(affinityKeys).toHaveLength(MAX_SESSION_AFFINITY_ENTRIES);
+		expect(lastUsedKeys).toEqual(affinityKeys);
+		expect(lastUsedKeys).not.toContain("s0");
+		expect(store.state.sessionLastUsedAtMs.s204).toBe(1_204);
+	});
+
+	it("drops a last-use entry with no affinity when pruning", () => {
+		const dir = makeTempDir();
+		const store = new RotatorStateStore({ statePath: statePathFor(dir) });
+
+		store.update((state) => {
+			state.sessionAffinity.s1 = "a";
+			state.sessionLastUsedAtMs.s1 = 10;
+			state.sessionLastUsedAtMs.orphan = 20;
+			pruneSessionAffinity(state.sessionAffinity, MAX_SESSION_AFFINITY_ENTRIES, state.sessionLastUsedAtMs);
+		});
+
+		expect(store.state.sessionLastUsedAtMs).toEqual({ s1: 10 });
 	});
 });
 

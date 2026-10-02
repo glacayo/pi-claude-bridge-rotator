@@ -261,6 +261,45 @@ describe("stop", () => {
 	});
 });
 
+describe("restart", () => {
+	it("runs again after stop+start, schedules one new interval, and discards old in-flight results", async () => {
+		const seam = timerSeam();
+		const resolvers: Array<(result: UsageFetchResult) => void> = [];
+		const fetchUsage: FetchUsage = () => new Promise((resolve) => {
+			resolvers.push(resolve);
+		});
+		const router = routerStub();
+		const poller = build({ fetchUsage, getTargets: () => target(router, [profile("a")]), seam });
+
+		poller.start();
+		seam.timeouts[0]?.fn();
+		expect(resolvers).toHaveLength(1);
+
+		// Stopping must not leave the profile marked in-flight, or the restarted
+		// poller would skip it forever.
+		poller.stop();
+		poller.start();
+
+		expect(poller.isRunning()).toBe(true);
+		expect(seam.timeouts).toHaveLength(2);
+		expect(seam.intervals).toHaveLength(2);
+		expect(seam.intervals[1]?.ms).toBe(USAGE_POLL_INTERVAL_MS);
+
+		seam.timeouts[1]?.fn();
+		expect(resolvers).toHaveLength(2);
+
+		// The pre-stop fetch resolves after restart: its generation is stale, so
+		// it is discarded and does not clear the restarted fetch's in-flight mark.
+		resolvers[0]?.({ ok: true, snapshot: okSnapshot() });
+		await flush();
+		expect(router.records).toHaveLength(0);
+
+		resolvers[1]?.({ ok: true, snapshot: okSnapshot() });
+		await flush();
+		expect(router.records.map((entry) => entry.profileId)).toEqual(["a"]);
+	});
+});
+
 describe("requestRefresh", () => {
 	it("refreshes a single profile and throttles repeat calls", async () => {
 		const seam = timerSeam();
