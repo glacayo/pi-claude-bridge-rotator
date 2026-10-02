@@ -12,7 +12,7 @@ import type { RotatorConfig } from "../src/config.js";
 import { CLAUDE_ACCOUNT_ROUTER_SYMBOL, ClaudeAccountRouter } from "../src/router.js";
 import { RotatorStateStore } from "../src/state.js";
 import type { ClaudeBridgeAccountHostV1, GlobalTarget } from "../src/host.js";
-import { createRotatorCommandHandler } from "../src/commands.js";
+import { createRotatorCommandHandler, STATUS_PROBE_BACKOFF_MS } from "../src/commands.js";
 import type {
 	FetchUsage,
 	NotifyLevel,
@@ -400,6 +400,94 @@ describe("status usage", () => {
 		await h.run("status");
 		expect(h.lastMessage()).toContain("cooldown: remaining 1d (unknown)");
 		expect(h.lastMessage()).toContain("usage: 5h 12% (resets in 2d)");
+	});
+
+	it("probes and refetches when the token is unauthorized", async () => {
+		const probes: string[] = [];
+		const host: ClaudeBridgeAccountHostV1 = {
+			version: 1,
+			probeProfile: async ({ profile: route }) => {
+				probes.push(route.profileId);
+				return {};
+			},
+		};
+		let calls = 0;
+		const fetchUsage: FetchUsage = async () => {
+			calls += 1;
+			return calls === 1 ? { ok: false, reason: "unauthorized" } : { ok: true, snapshot: successSnapshot() };
+		};
+		const config: RotatorConfig = { policy: "balanced", path: "/tmp/rotator-config.json", profiles: [profile("a")] };
+		const h = harness(config, { now: () => NOW, host, fetchUsage });
+
+		await h.run("status");
+
+		expect(probes).toEqual(["a"]);
+		expect(calls).toBe(2);
+		expect(h.lastMessage()).toContain("usage: 5h 12%");
+	});
+
+	it("backs off a persistently ineffective probe and retries after the window", async () => {
+		const probes: string[] = [];
+		const host: ClaudeBridgeAccountHostV1 = {
+			version: 1,
+			probeProfile: async ({ profile: route }) => {
+				probes.push(route.profileId);
+				return {};
+			},
+		};
+		let calls = 0;
+		const fetchUsage: FetchUsage = async () => {
+			calls += 1;
+			return { ok: false, reason: "token-expired" };
+		};
+		let current = NOW;
+		const config: RotatorConfig = { policy: "balanced", path: "/tmp/rotator-config.json", profiles: [profile("a")] };
+		const h = harness(config, { now: () => current, host, fetchUsage });
+
+		await h.run("status");
+		expect(probes).toEqual(["a"]);
+		expect(calls).toBe(2);
+
+		// Within the backoff the plain fetch still runs, but no probe (and no refetch).
+		await h.run("status");
+		expect(probes).toEqual(["a"]);
+		expect(calls).toBe(3);
+
+		current += STATUS_PROBE_BACKOFF_MS;
+		await h.run("status");
+		expect(probes).toEqual(["a", "a"]);
+		expect(calls).toBe(5);
+	});
+
+	it("does not back off when the probe fixes the token", async () => {
+		const probes: string[] = [];
+		const host: ClaudeBridgeAccountHostV1 = {
+			version: 1,
+			probeProfile: async ({ profile: route }) => {
+				probes.push(route.profileId);
+				return {};
+			},
+		};
+		const scripted: UsageFetchResult[] = [
+			{ ok: false, reason: "token-expired" },
+			{ ok: true, snapshot: successSnapshot() },
+			{ ok: false, reason: "token-expired" },
+			{ ok: true, snapshot: successSnapshot() },
+		];
+		let index = 0;
+		const fetchUsage: FetchUsage = async () => {
+			const result = scripted[Math.min(index, scripted.length - 1)];
+			index += 1;
+			return result ?? { ok: false, reason: "network" };
+		};
+		const config: RotatorConfig = { policy: "balanced", path: "/tmp/rotator-config.json", profiles: [profile("a")] };
+		const h = harness(config, { now: () => NOW, host, fetchUsage });
+
+		await h.run("status");
+		await h.run("status");
+
+		// A successful refetch is not a backoff: the next failure probes again.
+		expect(probes).toEqual(["a", "a"]);
 	});
 });
 

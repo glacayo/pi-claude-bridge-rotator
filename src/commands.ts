@@ -27,6 +27,7 @@ import { DEFAULT_GLOBAL_TARGET, resolveBridgeAccountHost } from "./host.js";
 import type { ProfileUsageError, ProfileUsageRecord, RotatorStateStore } from "./state.js";
 import { fetchPlanUsage } from "./usage.js";
 import type { UsageFetchResult, UsageWindow, UsageWindowName } from "./usage.js";
+import type { UsagePoller } from "./poller.js";
 
 export type NotifyLevel = "info" | "warning" | "error";
 
@@ -68,6 +69,14 @@ export interface RotatorCommandState {
 	publisher?: RouterPublisher | undefined;
 	/** Reload the config from disk and republish; set by the extension shell. */
 	refresh?: (() => void) | undefined;
+	/** The single process-wide usage poller, registered by the extension shell on
+	 *  `session_start`. Lives in shared state so `/reload` cannot create a
+	 *  second one; the shell reads the CURRENT router through its `getTargets`. */
+	poller?: UsagePoller | undefined;
+	/** In-memory-only timestamps of the last ineffective status probe per profile.
+	 *  Never persisted: it exists to stop a persistently broken token from
+	 *  spawning a CLI probe on every `status` inside the backoff window. */
+	statusProbeAtMs?: Record<string, number> | undefined;
 }
 
 /** Injected login driver: spawns `claude auth login` for one profile and
@@ -163,6 +172,11 @@ interface StatusDeps {
  *  give the official CLI a chance to refresh an expired access token. */
 const PROBE_REFRESH_DEADLINE_MS = 15000;
 
+/** A status probe that does not fix the token is not retried for this long, so
+ *  a persistently unauthorized account cannot spawn a CLI child on every
+ *  `status` invocation. In-memory and per process (shared command state). */
+export const STATUS_PROBE_BACKOFF_MS = 10 * 60_000;
+
 async function runStatus(state: RotatorCommandState, ctx: RotatorCommandContext, deps: StatusDeps): Promise<void> {
 	const config = state.config;
 	const router = state.router;
@@ -196,8 +210,15 @@ async function runStatus(state: RotatorCommandState, ctx: RotatorCommandContext,
 		const first = await deps.fetchUsage({ configDir: profile.configDir });
 		const needsRefresh = !first.ok && (first.reason === "token-expired" || first.reason === "unauthorized");
 		if (!needsRefresh || host === undefined) return first;
+		// A probe that just ran and did not fix the token is skipped until the
+		// backoff elapses; the plain fetch above still ran, so status stays fresh.
+		if (isStatusProbeBackedOff(state, profile.id, nowMs)) return first;
 		await probeProfileQuietly(host, profile, cwd);
-		return deps.fetchUsage({ configDir: profile.configDir });
+		const second = await deps.fetchUsage({ configDir: profile.configDir });
+		if (!second.ok && (second.reason === "token-expired" || second.reason === "unauthorized")) {
+			recordIneffectiveStatusProbe(state, profile.id, nowMs);
+		}
+		return second;
 	}));
 	config.profiles.forEach((profile, index) => {
 		const result = results[index];
@@ -242,6 +263,17 @@ async function probeProfileQuietly(
 	} catch {
 		// Never throws: a probe failure must not change the reported reason.
 	}
+}
+
+function isStatusProbeBackedOff(state: RotatorCommandState, profileId: string, nowMs: number): boolean {
+	const lastProbeMs = state.statusProbeAtMs?.[profileId];
+	return lastProbeMs !== undefined && nowMs - lastProbeMs < STATUS_PROBE_BACKOFF_MS;
+}
+
+function recordIneffectiveStatusProbe(state: RotatorCommandState, profileId: string, nowMs: number): void {
+	const existing = state.statusProbeAtMs;
+	if (existing === undefined) state.statusProbeAtMs = { [profileId]: nowMs };
+	else existing[profileId] = nowMs;
 }
 
 interface LoginDeps {

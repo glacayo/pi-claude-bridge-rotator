@@ -138,9 +138,28 @@ probe (15 s) to refresh, then polls once more.
 
 ## How rotation works
 
-- **Balanced by session**: every new session is routed round-robin over the
-  eligible profiles; within a session, requests stick to its profile so Claude
-  Code `--resume` keeps working (the bridge needs the exact `configDir`).
+- **Usage-aware ranking for new sessions**: the router ranks the eligible
+  profiles from their cached plan-usage snapshot and sends a new session to the
+  best one. The score rewards *weekly headroom* (the expected use for how far
+  the 7-day window has elapsed, minus actual use) plus a small "use it or lose
+  it" bonus for 5-hour headroom that resets within the hour, and subtracts a
+  penalty for current 5-hour use. Hard caps — 5-hour utilization ≥ 95 % or
+  weekly utilization ≥ 98 % — move an account to the back of the order as a
+  last resort. Accounts with no snapshot, or one older than 15 minutes, are
+  treated as unknown and placed between the healthy and the capped ones. Ties
+  keep the configured profile order, so the choice is fully deterministic:
+  the same inputs always produce the same route.
+- **Round-robin fallback**: until the first snapshot arrives (or when every
+  snapshot is stale), ranking degrades to the cursor round-robin over the
+  eligible profiles, so rotation is never worse than it was before.
+- **Background refresh**: one poller per process refreshes every account's usage
+  every 5 minutes, plus once more after a successful request (at most once per
+  account per minute). Routing itself reads only the cached snapshot: `acquire`
+  is synchronous and never fetches, so a slow endpoint can never stall a turn.
+- **Session affinity is unchanged in this stage**: within a session, requests
+  stick to its profile so Claude Code `--resume` keeps working (the bridge needs
+  the exact `configDir`). Moving a bound session between accounts is the next
+  stage.
 - **Cooldowns**: a rate-limited account stops receiving traffic until the
   upstream reset time (or a 30-minute default when the payload carries no
   reset); all traffic goes to the remaining account(s). The bridge's retry loop
@@ -195,8 +214,8 @@ sessions), a cached identity per profile, and a normalized plan-usage snapshot
 
 ## Non-goals (v1)
 
-Model-scoped quota rotation (`route.modelId`), quota-aware probing for
-selection, auto-detection of profiles, and multi-policy runtime switching.
+Model-scoped quota rotation (`route.modelId`), auto-detection of profiles, and
+multi-policy runtime switching.
 
 ## License
 

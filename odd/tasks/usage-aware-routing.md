@@ -139,7 +139,7 @@ prompt-cache loss.
   profiles in parallel and renders `usage: 5h N% (resets …) · weekly N%
   (resets …)` or the failure reason with last-known age, expired-token probe
   fallback, README. Route: delegated writer (multi-file).
-- [ ] 2. Usage-aware balancer: reload-safe background poller + post-request
+- [x] 2. Usage-aware balancer: reload-safe background poller + post-request
   throttled refresh, router ranking over the snapshot with hard usage cap,
   round-robin fallback, config→router plumbing, README rotation section.
   Route: delegated writer (multi-file).
@@ -156,7 +156,7 @@ prompt-cache loss.
 |---|---|---|
 | 0 | c1e6654 (+ docs f7e12b2, 182f054; chore 0853144) | SHAs resolved from `git ls-remote` (`v4` = `v4.4.0` for both); zizmor delta clean; tsc clean; vitest 134/134; assess `high` (`shell_source` in `ci.yml`) → independent verifier PASS 6/6; native review folded into the task 1 review (base `217d59d`, so these bytes are reviewed with it); CI run proven on the first stage PR |
 | 1 | 59932aa | tsc clean; vitest 197/197 (usage 36, router 49, commands 53, state 14, config 22, login 9, extension 14); live `fetchPlanUsage` against both real accounts OK, no token in output (claude-1 5h 0% / weekly 0%; claude-2 5h 57% / weekly 19%); independent verifier PASS 10/10; native review approved + burned (lineage `review-8c8d05f9622e0472`, range `217d59d..59932aa` incl. task 0, tier high, 4 lenses; readability needed one reoffered retry after a reviewer tool-call transport failure). Advisory: R2-last-known-indent, R2-probe-deadline-name, R3-001, R4-probe-sequential-latency, R4-status-probe-latency (status can take up to ~20 s when a token is expired and the probe runs) |
-| 2 | (pending) | |
+| 2 | b24d465 | tsc clean; vitest 250/250 (ranking 21, poller 16, router 58, extension 18, commands 56, usage 36, config 22, state 14, login 9); assess `unassessable` (schema-incompatible, treated as high) → independent verifier PASS 9/9 (no blocker/major); native review approved + burned (lineage `review-7c514e8566496832`, range `f498ff3..b24d465`, tier medium, lens `review-reliability`). Includes the fixes for task 1 advisories R4-status-persistent-401-probe (10-min probe backoff) and R3-unauthorized-probe-untested. Advisory: R3-poller-restart-untested, R3-usage-ranking-herd (new sessions all go to the single best account until the next refresh; addressed in task 3). Known benign gap: if the first account is configured mid-session, the poller starts at the next `session_start` (round-robin until then; status still records snapshots) |
 | 3 | (pending) | |
 | 4 | (pending) | |
 
@@ -168,5 +168,11 @@ prompt-cache loss.
 - Review boundary: last reviewed = `59932aa` (tasks 0 + 1 reviewed together).
   Actual task 1 size was ~1350 changed lines incl. tests and docs (forecast
   ~450): the full test list and README were required, nothing was dropped.
-- Next: PR-1 `feat/usage-status` → `feat/usage-aware-routing`; then task 2 on
-  `feat/usage-balancer`.
+- PR #2 (`feat/usage-status`) merged into the integration branch by the parent
+  with user authorization (`f498ff3`). The docs-only delta `217d59d..d587e39`
+  was also reviewed at the user's request: lineage `review-467ebf8f29503306`,
+  approved + burned; advisories R2-001..003, R3-unauthorized-probe-untested,
+  R4-probe-sequential-latency, R4-status-persistent-401-probe.
+- Review boundary: last reviewed = `b24d465`.
+- Next: PR-2 `feat/usage-balancer` → `feat/usage-aware-routing`; then task 3
+  on `feat/usage-cache-switch` (also address R3-usage-ranking-herd).

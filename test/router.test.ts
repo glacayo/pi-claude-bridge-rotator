@@ -32,7 +32,11 @@ interface Harness {
 	warnings: string[];
 }
 
-function harness(profiles: RotatorProfileConfig[], startMs = START_MS): Harness {
+function harness(
+	profiles: RotatorProfileConfig[],
+	startMs = START_MS,
+	options: { onRequestSucceeded?: ((profileId: string) => void) | undefined } = {},
+): Harness {
 	const dir = makeTempDir();
 	const storePath = join(dir, "state.json");
 	let currentMs = startMs;
@@ -44,6 +48,7 @@ function harness(profiles: RotatorProfileConfig[], startMs = START_MS): Harness 
 		state: store,
 		now,
 		onWarn: (message) => warnings.push(message),
+		onRequestSucceeded: options.onRequestSucceeded,
 	});
 	return {
 		router,
@@ -654,5 +659,132 @@ describe("createRouter factory", () => {
 		expect(router.version).toBe(1);
 		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("a");
 		expect(router.acquire({ modelId: "m", sessionId: "s2" }).profileId).toBe("b");
+	});
+});
+
+describe("usage-aware ranking", () => {
+	const DAY_MS = 24 * HOUR_MS;
+
+	function fresh(weeklyUtil: number, fiveHourUtil = 0): { ok: true; snapshot: { fetchedAtMs: number; windows: Record<string, { utilization: number; resetsAtMs: number | null }> } } {
+		return {
+			ok: true,
+			snapshot: {
+				fetchedAtMs: START_MS,
+				windows: {
+					five_hour: { utilization: fiveHourUtil, resetsAtMs: null },
+					seven_day: { utilization: weeklyUtil, resetsAtMs: START_MS + 3 * DAY_MS },
+				},
+			},
+		};
+	}
+
+	it("picks the profile with the most weekly headroom from a fresh snapshot", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", fresh(90));
+		router.recordPlanUsage("b", fresh(5));
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
+	});
+
+	it("falls back to round-robin when every snapshot is stale", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		const stale = {
+			ok: true as const,
+			snapshot: { fetchedAtMs: START_MS - 60 * MINUTE_MS, windows: {} },
+		};
+		router.recordPlanUsage("a", stale);
+		router.recordPlanUsage("b", stale);
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("a");
+		expect(router.acquire({ modelId: "m", sessionId: "s2" }).profileId).toBe("b");
+	});
+
+	it("avoids a capped account", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", fresh(0, 96));
+		router.recordPlanUsage("b", fresh(10, 0));
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
+	});
+
+	it("honors exclusions on the ranked path", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", fresh(5));
+		router.recordPlanUsage("b", fresh(90));
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1", excludedProfileIds: ["a"] }).profileId).toBe("b");
+	});
+
+	it("sets the cursor past the ranked pick and affinity does not move it", () => {
+		const { router, store } = harness([profile("a"), profile("b"), profile("c")]);
+		router.recordPlanUsage("a", fresh(90));
+		router.recordPlanUsage("b", fresh(5));
+		router.recordPlanUsage("c", fresh(40));
+
+		// Ranking picks b (best headroom) regardless of the cursor; the cursor is
+		// advanced past b so a later round-robin fallback stays fair.
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
+		expect(store.state.cursor).toBe(2);
+		router.recordSuccess("b", "s1");
+
+		// An affinity hit changes nothing, cursor included.
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
+		expect(store.state.cursor).toBe(2);
+	});
+
+	it("routes the failover retry through the same ranking", () => {
+		const { router } = harness([profile("a"), profile("b"), profile("c")]);
+		router.recordPlanUsage("a", fresh(5));
+		router.recordPlanUsage("b", fresh(90));
+		router.recordPlanUsage("c", fresh(30));
+
+		const first = router.acquire({ modelId: "m", sessionId: "s1" });
+		expect(first.profileId).toBe("a");
+		const failover = router.acquire({
+			modelId: "m",
+			sessionId: "s1",
+			excludedProfileIds: [first.profileId],
+			forceRerank: true,
+			reason: "automatic-failover",
+		});
+		expect(failover.profileId).toBe("c");
+	});
+});
+
+describe("onRequestSucceeded", () => {
+	it("is invoked on every recorded success, session id or not", () => {
+		const calls: string[] = [];
+		const { router } = harness([profile("a"), profile("b")], START_MS, {
+			onRequestSucceeded: (profileId) => calls.push(profileId),
+		});
+
+		router.recordSuccess("a", "s1");
+		router.recordSuccess("b");
+
+		expect(calls).toEqual(["a", "b"]);
+	});
+
+	it("is ignored for an unknown profile", () => {
+		const calls: string[] = [];
+		const { router } = harness([profile("a")], START_MS, {
+			onRequestSucceeded: (profileId) => calls.push(profileId),
+		});
+
+		router.recordSuccess("missing", "s1");
+
+		expect(calls).toEqual([]);
+	});
+
+	it("is guarded so a throwing callback cannot break affinity", () => {
+		const { router, store, warnings } = harness([profile("a"), profile("b")], START_MS, {
+			onRequestSucceeded: () => {
+				throw new Error("refresh trigger down");
+			},
+		});
+
+		expect(() => router.recordSuccess("a", "s1")).not.toThrow();
+
+		expect(store.state.sessionAffinity.s1).toBe("a");
+		expect(warnings.some((message) => message.includes("onRequestSucceeded failed"))).toBe(true);
 	});
 });

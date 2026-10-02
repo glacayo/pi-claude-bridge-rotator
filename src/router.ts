@@ -14,6 +14,7 @@
 // a cooldown.
 
 import type { RotatorConfig, RotatorProfileConfig } from "./config.js";
+import { rankProfiles } from "./ranking.js";
 import { cloneJsonValue, MAX_SESSION_AFFINITY_ENTRIES, RotatorStateStore, touchSessionAffinity } from "./state.js";
 import type { JsonValue, ProfileUsageError, ProfileUsageRecord } from "./state.js";
 import type { UsageFetchResult } from "./usage.js";
@@ -126,6 +127,10 @@ export interface ClaudeAccountRouterOptions {
 	/** Recency bound for the in-memory per-session route cache. Defaults to
 	 *  `MAX_SESSION_AFFINITY_ENTRIES`; injectable so tests can use a tiny bound. */
 	maxSessionRouteEntries?: number | undefined;
+	/** Fire-and-forget hook invoked after a recorded success (used by the
+	 *  poller for an after-request usage refresh). Guarded: a throwing callback
+	 *  never breaks the success write or routing itself. */
+	onRequestSucceeded?: ((profileId: string) => void) | undefined;
 }
 
 export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
@@ -136,6 +141,7 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 	private readonly state: RotatorStateStore;
 	private readonly now: () => number;
 	private readonly onWarn: (message: string) => void;
+	private readonly onRequestSucceeded: ((profileId: string) => void) | undefined;
 	private readonly lastRouteBySession = new Map<string, ClaudeAccountRoute>();
 	private readonly maxSessionRouteEntries: number;
 	private lastGlobalRoute: ClaudeAccountRoute | undefined;
@@ -147,6 +153,7 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 		this.state = options.state;
 		this.now = options.now ?? (() => Date.now());
 		this.onWarn = options.onWarn ?? ((message: string) => console.warn(message));
+		this.onRequestSucceeded = options.onRequestSucceeded;
 		const limit = options.maxSessionRouteEntries;
 		this.maxSessionRouteEntries = typeof limit === "number" && Number.isSafeInteger(limit) && limit >= 0
 			? limit
@@ -165,18 +172,40 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 			if (bound !== undefined && this.isEligible(bound, excluded, nowMs)) return this.issue(bound, sessionId);
 		}
 
-		// Otherwise round-robin. The bridge's own failover retry passes
-		// `forceRerank` plus the failed ids as `excludedProfileIds`; honoring the
-		// exclusions while the cursor advances naturally lands elsewhere, so no
-		// separate rerank machinery is needed.
-		const start = this.cursor();
-		for (let offset = 0; offset < this.profileList.length; offset += 1) {
-			const index = (start + offset) % this.profileList.length;
-			const candidate = this.profileList[index];
-			if (candidate === undefined) continue;
-			if (!this.isEligible(candidate.id, excluded, nowMs)) continue;
-			this.advanceCursor(index + 1);
-			return this.issue(candidate.id, sessionId);
+		// Collect eligible candidates in profile order, then rank them. Ranking is
+		// deterministic and reads only the cached snapshot (`acquire` never
+		// fetches). With no fresh snapshot at all it degrades to today's cursor
+		// round-robin.
+		const candidates: string[] = [];
+		for (const profile of this.profileList) {
+			if (this.isEligible(profile.id, excluded, nowMs)) candidates.push(profile.id);
+		}
+		const ranked = rankProfiles({ candidates, usage: (id) => this.planUsage(id), nowMs });
+
+		if (ranked.mode === "usage") {
+			// Usage mode always yields a non-empty order when at least one profile
+			// is eligible. Advance the cursor past the pick so a later fallback to
+			// round-robin stays fair.
+			const picked = ranked.order[0];
+			if (picked !== undefined) {
+				const index = this.profileList.findIndex((profile) => profile.id === picked);
+				this.advanceCursor(index + 1);
+				return this.issue(picked, sessionId);
+			}
+		} else {
+			// Today's cursor loop, unchanged: the bridge's own failover retry passes
+			// `forceRerank` plus the failed ids as `excludedProfileIds`; honoring the
+			// exclusions while the cursor advances naturally lands elsewhere, so no
+			// separate rerank machinery is needed.
+			const start = this.cursor();
+			for (let offset = 0; offset < this.profileList.length; offset += 1) {
+				const index = (start + offset) % this.profileList.length;
+				const candidate = this.profileList[index];
+				if (candidate === undefined) continue;
+				if (!this.isEligible(candidate.id, excluded, nowMs)) continue;
+				this.advanceCursor(index + 1);
+				return this.issue(candidate.id, sessionId);
+			}
 		}
 
 		throw this.unavailableError(input, nowMs);
@@ -240,6 +269,9 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 	recordSuccess(profileId: string, sessionId?: string): void {
 		this.guard("recordSuccess", undefined, () => {
 			if (!this.profiles.has(profileId)) return;
+			// Best-effort usage refresh trigger, independent of the session write
+			// below: it fires even when the bridge reports no session id.
+			this.invokeRequestSucceeded(profileId);
 			const sid = nonEmptyString(sessionId);
 			if (sid === undefined) return;
 			this.state.update((state) => {
@@ -430,6 +462,18 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 		);
 	}
 
+	private invokeRequestSucceeded(profileId: string): void {
+		const callback = this.onRequestSucceeded;
+		if (callback === undefined) return;
+		try {
+			callback(profileId);
+		} catch (error) {
+			// A refresh trigger is best-effort: it must never break a recorded
+			// success or the session-affinity write that follows it.
+			this.warn(`onRequestSucceeded failed: ${describeError(error)}`);
+		}
+	}
+
 	private guard<T>(label: string, fallback: T, body: () => T): T {
 		try {
 			return body();
@@ -454,6 +498,7 @@ export interface CreateRouterOptions {
 	env?: NodeJS.ProcessEnv | undefined;
 	now?: (() => number) | undefined;
 	onWarn?: ((message: string) => void) | undefined;
+	onRequestSucceeded?: ((profileId: string) => void) | undefined;
 }
 
 /** Build a router for a loaded config. Unit 2 calls this during extension
@@ -470,6 +515,7 @@ export function createRouter(config: RotatorConfig, options: CreateRouterOptions
 		state,
 		now: options.now,
 		onWarn: options.onWarn,
+		onRequestSucceeded: options.onRequestSucceeded,
 	});
 }
 

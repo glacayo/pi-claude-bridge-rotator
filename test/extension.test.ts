@@ -46,6 +46,32 @@ interface FakePi {
 	handlers: Map<string, Array<(...args: unknown[]) => unknown>>;
 }
 
+interface TimerSpy {
+	timers: { intervals: number; timeouts: number; cleared: number };
+	setIntervalFn: () => unknown;
+	clearIntervalFn: () => void;
+	setTimeoutFn: () => unknown;
+}
+
+/** Manual timer seam: records timer activity and never schedules anything real. */
+function timerSpy(): TimerSpy {
+	const timers = { intervals: 0, timeouts: 0, cleared: 0 };
+	return {
+		timers,
+		setIntervalFn: (): unknown => {
+			timers.intervals += 1;
+			return { unref(): void {} };
+		},
+		clearIntervalFn: (): void => {
+			timers.cleared += 1;
+		},
+		setTimeoutFn: (): unknown => {
+			timers.timeouts += 1;
+			return { unref(): void {} };
+		},
+	};
+}
+
 function makeFakePi(): FakePi {
 	const registered: string[] = [];
 	const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
@@ -62,6 +88,15 @@ function makeFakePi(): FakePi {
 	// SAFETY: the extension only calls `registerCommand` and `on`, and this fake
 	// implements both with the same runtime shape the real `pi` object has.
 	return { pi: fake as unknown as ExtensionAPI, registered, handlers };
+}
+
+/** Invoke every handler pi registered for an event (mirrors pi's dispatch). */
+function dispatch(
+	handlers: Map<string, Array<(...args: unknown[]) => unknown>>,
+	event: string,
+	...args: unknown[]
+): void {
+	for (const handler of handlers.get(event) ?? []) handler(...args);
 }
 
 interface AgentDir {
@@ -207,7 +242,7 @@ describe("activateExtension wiring", () => {
 		const target: GlobalTarget = {};
 		const agent = makeAgentDir(true);
 
-		activateExtension(pi, { globalTarget: target, env: agent.env });
+		activateExtension(pi, { globalTarget: target, env: agent.env, ...timerSpy() });
 		const startHandlers = handlers.get("session_start") ?? [];
 		const notifies: string[] = [];
 		const ctx = { ui: { notify: (message: string) => notifies.push(message) } };
@@ -225,7 +260,7 @@ describe("activateExtension wiring", () => {
 		target[CLAUDE_BRIDGE_ACCOUNT_HOST_SYMBOL] = { version: 1, probeProfile: async () => ({}) };
 		const agent = makeAgentDir(true);
 
-		activateExtension(pi, { globalTarget: target, env: agent.env });
+		activateExtension(pi, { globalTarget: target, env: agent.env, ...timerSpy() });
 		const notifies: string[] = [];
 		for (const handler of handlers.get("session_start") ?? []) {
 			handler({}, { ui: { notify: (message: string) => notifies.push(message) } });
@@ -243,6 +278,69 @@ describe("activateExtension wiring", () => {
 		expect(registered).toEqual(["claude-accounts"]);
 		expect(target[CLAUDE_ACCOUNT_ROUTER_SYMBOL]).toBeDefined();
 		expect(typeof createRotatorCommandHandler).toBe("function");
+	});
+});
+
+describe("usage poller lifecycle", () => {
+	it("creates and starts exactly one poller on session_start, never before", () => {
+		const { pi, handlers } = makeFakePi();
+		const target: GlobalTarget = {};
+		const agent = makeAgentDir(true);
+		const timers = timerSpy();
+
+		activateExtension(pi, { globalTarget: target, env: agent.env, ...timers });
+
+		// Nothing scheduled at activation: timers start only with the session.
+		expect(commandState(target).poller).toBeUndefined();
+		expect(timers.timers).toEqual({ intervals: 0, timeouts: 0, cleared: 0 });
+
+		dispatch(handlers, "session_start", {}, { ui: { notify: () => {} } });
+
+		expect(commandState(target).poller?.isRunning()).toBe(true);
+		expect(timers.timers.timeouts).toBe(1);
+		expect(timers.timers.intervals).toBe(1);
+	});
+
+	it("does not create a second poller across a reload", () => {
+		const { pi, handlers } = makeFakePi();
+		const target: GlobalTarget = {};
+		const agent = makeAgentDir(true);
+		const timers = timerSpy();
+
+		activateExtension(pi, { globalTarget: target, env: agent.env, ...timers });
+		activateExtension(pi, { globalTarget: target, env: agent.env, ...timers });
+		dispatch(handlers, "session_start", {}, { ui: { notify: () => {} } });
+		dispatch(handlers, "session_start", {}, { ui: { notify: () => {} } });
+
+		expect(timers.timers.intervals).toBe(1);
+		expect(commandState(target).poller?.isRunning()).toBe(true);
+	});
+
+	it("stops the poller on session_shutdown", () => {
+		const { pi, handlers } = makeFakePi();
+		const target: GlobalTarget = {};
+		const agent = makeAgentDir(true);
+		const timers = timerSpy();
+
+		activateExtension(pi, { globalTarget: target, env: agent.env, ...timers });
+		dispatch(handlers, "session_start", {}, { ui: { notify: () => {} } });
+		dispatch(handlers, "session_shutdown", {});
+
+		expect(commandState(target).poller?.isRunning()).toBe(false);
+		expect(timers.timers.cleared).toBe(2);
+	});
+
+	it("does not start a poller when the config is broken", () => {
+		const { pi, handlers } = makeFakePi();
+		const target: GlobalTarget = {};
+		const agent = makeAgentDir(false);
+		const timers = timerSpy();
+
+		activateExtension(pi, { globalTarget: target, env: agent.env, ...timers });
+		dispatch(handlers, "session_start", {}, { ui: { notify: () => {} } });
+
+		expect(commandState(target).poller).toBeUndefined();
+		expect(timers.timers.intervals).toBe(0);
 	});
 });
 
