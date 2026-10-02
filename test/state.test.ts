@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { cleanupTempDirs, makeTempDir } from "./helpers.js";
 import {
@@ -92,6 +92,47 @@ describe("RotatorStateStore loading", () => {
 		expect(store.state.cursor).toBe(0);
 		expect(store.state.identity).toEqual({});
 		expect(store.state.failures.p).toBeUndefined();
+	});
+});
+
+describe("update base state", () => {
+	it("merges into the in-memory state when the file became corrupt instead of wiping it", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		const warnings: string[] = [];
+		const store = new RotatorStateStore({ statePath, onWarn: (message) => warnings.push(message) });
+		store.update((state) => {
+			touchSessionAffinity(state.sessionAffinity, "s1", "a", MAX_SESSION_AFFINITY_ENTRIES, state.sessionLastUsedAtMs, 1);
+			state.cooldowns.b = { untilMs: 9_999, rateLimitType: "five_hour" };
+		});
+		writeFileSync(statePath, "{ corrupted by another writer");
+
+		store.update((state) => {
+			touchSessionAffinity(state.sessionAffinity, "s2", "b", MAX_SESSION_AFFINITY_ENTRIES, state.sessionLastUsedAtMs, 2);
+		});
+
+		const reloaded = new RotatorStateStore({ statePath });
+		expect(reloaded.state.sessionAffinity).toEqual({ s1: "a", s2: "b" });
+		expect(reloaded.state.cooldowns.b?.untilMs).toBe(9_999);
+		expect(warnings.some((message) => message.includes("corrupt"))).toBe(true);
+	});
+
+	it("starts fresh when the file was deleted", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		const store = new RotatorStateStore({ statePath });
+		store.update((state) => {
+			state.cooldowns.a = { untilMs: 5, rateLimitType: "five_hour" };
+		});
+		rmSync(statePath);
+
+		store.update((state) => {
+			state.cursor = 1;
+		});
+
+		const reloaded = new RotatorStateStore({ statePath });
+		expect(reloaded.state.cooldowns).toEqual({});
+		expect(reloaded.state.cursor).toBe(1);
 	});
 });
 
@@ -297,8 +338,7 @@ describe("session last-use state", () => {
 });
 
 describe("RotatorStateStore persistence", () => {
-	it("round-trips state through a reload", () => {
-		const dir = makeTempDir();
+	it("round-trips state through a reload", () => {		const dir = makeTempDir();
 		const statePath = statePathFor(dir);
 		const store = new RotatorStateStore({ statePath });
 
@@ -384,5 +424,135 @@ describe("RotatorStateStore persistence", () => {
 
 		expect(Object.keys(store.state.sessionAffinity)).toEqual(["s2", "s1"]);
 		expect(store.state.sessionAffinity.s1).toBe("b");
+	});
+});
+
+describe("cross-process state writes", () => {
+	it("merges updates from two stores instead of clobbering them", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		const a = new RotatorStateStore({ statePath });
+		const b = new RotatorStateStore({ statePath });
+
+		a.update((state) => {
+			touchSessionAffinity(state.sessionAffinity, "s1", "a", MAX_SESSION_AFFINITY_ENTRIES, state.sessionLastUsedAtMs, 111);
+		});
+		b.update((state) => {
+			touchSessionAffinity(state.sessionAffinity, "s2", "b", MAX_SESSION_AFFINITY_ENTRIES, state.sessionLastUsedAtMs, 222);
+		});
+		// A's later write must not erase B's session: update re-reads disk first.
+		a.update((state) => {
+			state.cursor = 5;
+		});
+
+		const reloaded = new RotatorStateStore({ statePath });
+		expect(reloaded.state.sessionAffinity).toEqual({ s1: "a", s2: "b" });
+		expect(reloaded.state.sessionLastUsedAtMs).toEqual({ s1: 111, s2: 222 });
+		expect(reloaded.state.cursor).toBe(5);
+		// Both in-memory copies also converge on the merged state.
+		expect(a.state.sessionAffinity).toEqual({ s1: "a", s2: "b" });
+		expect(b.state.sessionAffinity).toEqual({ s1: "a", s2: "b" });
+	});
+
+	it("reloads another store's write after the stat throttle window", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		let currentMs = 1_800_000_000_000;
+		const now = (): number => currentMs;
+		const a = new RotatorStateStore({ statePath, now });
+		const b = new RotatorStateStore({ statePath, now });
+
+		a.update((state) => {
+			state.cursor = 7;
+		});
+
+		// Inside the 250 ms throttle window the getter must not re-stat the disk:
+		// it keeps serving the snapshot it already read.
+		expect(b.state.cursor).toBe(0);
+		a.update((state) => {
+			state.cursor = 8;
+		});
+		expect(b.state.cursor).toBe(0);
+
+		currentMs += 300;
+
+		expect(b.state.cursor).toBe(8);
+	});
+
+	it("waits for a held fresh lock, then merges without it and warns once", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		writeFileSync(statePath, JSON.stringify({ version: 1, sessionAffinity: { s1: "a" } }));
+		const lockPath = `${statePath}.lock`;
+		// A fresh lock held by "another process": recent mtime, so not stale.
+		writeFileSync(lockPath, "");
+		const warnings: string[] = [];
+		const store = new RotatorStateStore({
+			statePath,
+			lockPath,
+			sleep: () => {},
+			lockRetryMs: 1,
+			lockTimeoutMs: 3,
+			onWarn: (message) => warnings.push(message),
+		});
+
+		store.update((state) => {
+			state.cursor = 3;
+		});
+
+		expect(warnings.filter((message) => message.includes("lock"))).toHaveLength(1);
+		// The unlocked fallback still merged onto the disk state.
+		const reloaded = new RotatorStateStore({ statePath });
+		expect(reloaded.state.sessionAffinity).toEqual({ s1: "a" });
+		expect(reloaded.state.cursor).toBe(3);
+		// A lock this store never created must not be removed.
+		expect(existsSync(lockPath)).toBe(true);
+	});
+
+	it("breaks a stale lock and completes the write", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		const lockPath = `${statePath}.lock`;
+		writeFileSync(lockPath, "");
+		utimesSync(lockPath, 0, 0);
+
+		const store = new RotatorStateStore({ statePath, lockPath, sleep: () => {} });
+		store.update((state) => {
+			state.cursor = 9;
+		});
+
+		expect(new RotatorStateStore({ statePath }).state.cursor).toBe(9);
+		expect(existsSync(lockPath)).toBe(false);
+	});
+
+	it("removes its lock after a successful update and a throwing mutator", () => {
+		const dir = makeTempDir();
+		const statePath = statePathFor(dir);
+		const lockPath = `${statePath}.lock`;
+		const store = new RotatorStateStore({ statePath });
+
+		store.update((state) => {
+			state.cursor = 1;
+		});
+		expect(existsSync(lockPath)).toBe(false);
+
+		expect(() => store.update(() => {
+			throw new Error("boom");
+		})).toThrow("boom");
+		expect(existsSync(lockPath)).toBe(false);
+		expect(readdirSync(dir).filter((name) => name.endsWith(".lock") || name.endsWith(".tmp"))).toEqual([]);
+	});
+
+	it("runs the mutator exactly once per update", () => {
+		const dir = makeTempDir();
+		const store = new RotatorStateStore({ statePath: statePathFor(dir) });
+		let calls = 0;
+
+		store.update((state) => {
+			calls += 1;
+			state.cursor = 1;
+		});
+
+		expect(calls).toBe(1);
 	});
 });
