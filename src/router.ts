@@ -14,8 +14,10 @@
 // a cooldown.
 
 import type { RotatorConfig, RotatorProfileConfig } from "./config.js";
+import { decideAffinity, NEW_SESSION_PENALTY, rankProfiles } from "./ranking.js";
 import { cloneJsonValue, MAX_SESSION_AFFINITY_ENTRIES, RotatorStateStore, touchSessionAffinity } from "./state.js";
-import type { JsonValue } from "./state.js";
+import type { JsonValue, ProfileUsageError, ProfileUsageRecord } from "./state.js";
+import type { UsageFetchResult } from "./usage.js";
 
 /** The bridge's published contract symbol (see contract authority above). */
 export const CLAUDE_ACCOUNT_ROUTER_SYMBOL = Symbol.for("kendex.pi.claude-account-router.v1");
@@ -125,6 +127,10 @@ export interface ClaudeAccountRouterOptions {
 	/** Recency bound for the in-memory per-session route cache. Defaults to
 	 *  `MAX_SESSION_AFFINITY_ENTRIES`; injectable so tests can use a tiny bound. */
 	maxSessionRouteEntries?: number | undefined;
+	/** Fire-and-forget hook invoked after a recorded success (used by the
+	 *  poller for an after-request usage refresh). Guarded: a throwing callback
+	 *  never breaks the success write or routing itself. */
+	onRequestSucceeded?: ((profileId: string) => void) | undefined;
 }
 
 export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
@@ -135,8 +141,13 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 	private readonly state: RotatorStateStore;
 	private readonly now: () => number;
 	private readonly onWarn: (message: string) => void;
+	private readonly onRequestSucceeded: ((profileId: string) => void) | undefined;
 	private readonly lastRouteBySession = new Map<string, ClaudeAccountRoute>();
 	private readonly maxSessionRouteEntries: number;
+	/** New (non-affinity) sessions routed to each profile since that profile's
+	 *  current snapshot, keyed by `fetchedAtMs` so a newer snapshot resets the
+	 *  count. In-memory only; a restart just starts the spread over. */
+	private readonly newSessionsSinceSnapshot = new Map<string, { fetchedAtMs: number; count: number }>();
 	private lastGlobalRoute: ClaudeAccountRoute | undefined;
 	private warnedOnce = false;
 
@@ -146,6 +157,7 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 		this.state = options.state;
 		this.now = options.now ?? (() => Date.now());
 		this.onWarn = options.onWarn ?? ((message: string) => console.warn(message));
+		this.onRequestSucceeded = options.onRequestSucceeded;
 		const limit = options.maxSessionRouteEntries;
 		this.maxSessionRouteEntries = typeof limit === "number" && Number.isSafeInteger(limit) && limit >= 0
 			? limit
@@ -156,26 +168,71 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 		const nowMs = this.now();
 		const excluded = new Set((input.excludedProfileIds ?? []).filter((id) => typeof id === "string"));
 		const sessionId = nonEmptyString(input.sessionId);
+		const bound = sessionId === undefined ? undefined : this.state.state.sessionAffinity[sessionId];
+		// A session counts as "new" for the spread penalty only when it has no
+		// affinity at all: a forced move off an ineligible account is not new.
+		const isNewSession = bound === undefined;
 
-		// Affinity first: a bound session keeps its account so Claude Code
-		// `--resume` keeps finding the JSONL it wrote under that config dir.
-		if (sessionId !== undefined) {
-			const bound = this.state.state.sessionAffinity[sessionId];
-			if (bound !== undefined && this.isEligible(bound, excluded, nowMs)) return this.issue(bound, sessionId);
+		// Collect eligible candidates once, in profile order. Ranking is
+		// deterministic and reads only the cached snapshot (`acquire` never
+		// fetches). With no fresh snapshot at all it degrades to today's cursor
+		// round-robin.
+		const candidates: string[] = [];
+		for (const profile of this.profileList) {
+			if (this.isEligible(profile.id, excluded, nowMs)) candidates.push(profile.id);
 		}
 
-		// Otherwise round-robin. The bridge's own failover retry passes
-		// `forceRerank` plus the failed ids as `excludedProfileIds`; honoring the
-		// exclusions while the cursor advances naturally lands elsewhere, so no
-		// separate rerank machinery is needed.
-		const start = this.cursor();
-		for (let offset = 0; offset < this.profileList.length; offset += 1) {
-			const index = (start + offset) % this.profileList.length;
-			const candidate = this.profileList[index];
-			if (candidate === undefined) continue;
-			if (!this.isEligible(candidate.id, excluded, nowMs)) continue;
-			this.advanceCursor(index + 1);
-			return this.issue(candidate.id, sessionId);
+		// Affinity first: a bound session keeps its account so Claude Code
+		// `--resume` keeps finding the JSONL it wrote under that config dir. It
+		// may still move for the cache-aware reasons below (hard cap, or soft cap
+		// with a cold cache). An eligibility failure falls through unchanged.
+		if (sessionId !== undefined && bound !== undefined && this.isEligible(bound, excluded, nowMs)) {
+			const decision = decideAffinity({
+				bound,
+				candidates,
+				usage: (id) => this.planUsage(id),
+				nowMs,
+				lastUsedAtMs: this.state.state.sessionLastUsedAtMs[sessionId],
+			});
+			if (!decision.moved) return this.issue(bound, sessionId);
+			// A move behaves like a normal ranked pick: advance past it and issue
+			// the new route, which rebinds the session's in-memory route.
+			this.advanceCursor(this.profileIndexAfter(decision.profileId));
+			return this.issue(decision.profileId, sessionId);
+		}
+
+		const ranked = rankProfiles({
+			candidates,
+			usage: (id) => this.planUsage(id),
+			nowMs,
+			penalty: (id) => this.newSessionPenalty(id),
+		});
+
+		if (ranked.mode === "usage") {
+			// Usage mode always yields a non-empty order when at least one profile
+			// is eligible. Advance the cursor past the pick so a later fallback to
+			// round-robin stays fair.
+			const picked = ranked.order[0];
+			if (picked !== undefined) {
+				this.advanceCursor(this.profileIndexAfter(picked));
+				if (isNewSession) this.countNewSession(picked);
+				return this.issue(picked, sessionId);
+			}
+		} else {
+			// Today's cursor loop, unchanged: the bridge's own failover retry passes
+			// `forceRerank` plus the failed ids as `excludedProfileIds`; honoring the
+			// exclusions while the cursor advances naturally lands elsewhere, so no
+			// separate rerank machinery is needed.
+			const start = this.cursor();
+			for (let offset = 0; offset < this.profileList.length; offset += 1) {
+				const index = (start + offset) % this.profileList.length;
+				const candidate = this.profileList[index];
+				if (candidate === undefined) continue;
+				if (!this.isEligible(candidate.id, excluded, nowMs)) continue;
+				this.advanceCursor(index + 1);
+				if (isNewSession) this.countNewSession(candidate.id);
+				return this.issue(candidate.id, sessionId);
+			}
 		}
 
 		throw this.unavailableError(input, nowMs);
@@ -239,10 +296,21 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 	recordSuccess(profileId: string, sessionId?: string): void {
 		this.guard("recordSuccess", undefined, () => {
 			if (!this.profiles.has(profileId)) return;
+			// Best-effort usage refresh trigger, independent of the session write
+			// below: it fires even when the bridge reports no session id.
+			this.invokeRequestSucceeded(profileId);
 			const sid = nonEmptyString(sessionId);
 			if (sid === undefined) return;
+			const atMs = this.now();
 			this.state.update((state) => {
-				touchSessionAffinity(state.sessionAffinity, sid, profileId);
+				touchSessionAffinity(
+					state.sessionAffinity,
+					sid,
+					profileId,
+					MAX_SESSION_AFFINITY_ENTRIES,
+					state.sessionLastUsedAtMs,
+					atMs,
+				);
 			});
 		});
 	}
@@ -271,6 +339,37 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 				state.identity[profileId] = { ...state.identity[profileId], usage: cloned, updatedAtMs: this.now() };
 			});
 		});
+	}
+
+	/** Store the outcome of one plan-usage poll.
+	 *
+	 *  Not part of the bridge contract: usage-aware routing (a later stage) reads
+	 *  it through `planUsage`. On success the snapshot replaces the previous one
+	 *  and the error is cleared; on failure the previous snapshot is kept and the
+	 *  typed reason is recorded, so status can still show last known values.
+	 *  Guarded like the other telemetry methods and a no-op for unknown ids. */
+	recordPlanUsage(profileId: string, result: UsageFetchResult): void {
+		this.guard("recordPlanUsage", undefined, () => {
+			if (!this.profiles.has(profileId)) return;
+			const atMs = this.now();
+			this.state.update((state) => {
+				const previous = state.usage[profileId]?.snapshot;
+				if (result.ok) {
+					state.usage[profileId] = { snapshot: result.snapshot };
+					return;
+				}
+				const lastError: ProfileUsageError = { reason: result.reason, atMs };
+				if (result.httpStatus !== undefined) lastError.httpStatus = result.httpStatus;
+				const record: ProfileUsageRecord = { lastError };
+				if (previous !== undefined) record.snapshot = previous;
+				state.usage[profileId] = record;
+			});
+		});
+	}
+
+	/** Read the stored plan-usage record for a profile (never throws). */
+	planUsage(profileId: string): ProfileUsageRecord | undefined {
+		return this.guard("planUsage", undefined, () => this.state.state.usage[profileId]);
 	}
 
 	current(_modelId: string, sessionId?: string): ClaudeAccountRoute | undefined {
@@ -338,6 +437,34 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 		return Number.isSafeInteger(stored) && stored >= 0 ? stored % length : 0;
 	}
 
+	/** Cursor value that points just past `profileId` (the index of the pick plus
+	 *  one); if the id left the config the cursor simply wraps to the start. */
+	private profileIndexAfter(profileId: string): number {
+		return this.profileList.findIndex((profile) => profile.id === profileId) + 1;
+	}
+
+	/** In-memory herd penalty for `profileId`: points for each new session routed
+	 *  to it since its current snapshot. A newer snapshot (different
+	 *  `fetchedAtMs`) resets the count, and a missing snapshot is no penalty. */
+	private newSessionPenalty(profileId: string): number {
+		const entry = this.newSessionsSinceSnapshot.get(profileId);
+		if (entry === undefined) return 0;
+		const snapshot = this.planUsage(profileId)?.snapshot;
+		if (snapshot === undefined || snapshot.fetchedAtMs !== entry.fetchedAtMs) return 0;
+		return entry.count * NEW_SESSION_PENALTY;
+	}
+
+	private countNewSession(profileId: string): void {
+		const snapshot = this.planUsage(profileId)?.snapshot;
+		if (snapshot === undefined) return;
+		const entry = this.newSessionsSinceSnapshot.get(profileId);
+		if (entry === undefined || entry.fetchedAtMs !== snapshot.fetchedAtMs) {
+			this.newSessionsSinceSnapshot.set(profileId, { fetchedAtMs: snapshot.fetchedAtMs, count: 1 });
+			return;
+		}
+		entry.count += 1;
+	}
+
 	private advanceCursor(value: number): void {
 		const length = this.profileList.length;
 		const next = length === 0 ? 0 : value % length;
@@ -398,6 +525,18 @@ export class ClaudeAccountRouter implements ClaudeAccountRouterV1 {
 		);
 	}
 
+	private invokeRequestSucceeded(profileId: string): void {
+		const callback = this.onRequestSucceeded;
+		if (callback === undefined) return;
+		try {
+			callback(profileId);
+		} catch (error) {
+			// A refresh trigger is best-effort: it must never break a recorded
+			// success or the session-affinity write that follows it.
+			this.warn(`onRequestSucceeded failed: ${describeError(error)}`);
+		}
+	}
+
 	private guard<T>(label: string, fallback: T, body: () => T): T {
 		try {
 			return body();
@@ -422,6 +561,7 @@ export interface CreateRouterOptions {
 	env?: NodeJS.ProcessEnv | undefined;
 	now?: (() => number) | undefined;
 	onWarn?: ((message: string) => void) | undefined;
+	onRequestSucceeded?: ((profileId: string) => void) | undefined;
 }
 
 /** Build a router for a loaded config. Unit 2 calls this during extension
@@ -438,6 +578,7 @@ export function createRouter(config: RotatorConfig, options: CreateRouterOptions
 		state,
 		now: options.now,
 		onWarn: options.onWarn,
+		onRequestSucceeded: options.onRequestSucceeded,
 	});
 }
 

@@ -24,7 +24,10 @@ import type { ClaudeAccountIdentity } from "./router.js";
 import { CLAUDE_ACCOUNT_ROUTER_SYMBOL, type ClaudeAccountRouter } from "./router.js";
 import type { ClaudeBridgeAccountHostV1, GlobalTarget } from "./host.js";
 import { DEFAULT_GLOBAL_TARGET, resolveBridgeAccountHost } from "./host.js";
-import type { RotatorStateStore } from "./state.js";
+import type { ProfileUsageError, ProfileUsageRecord, RotatorStateStore } from "./state.js";
+import { fetchPlanUsage } from "./usage.js";
+import type { UsageFetchResult, UsageWindow, UsageWindowName } from "./usage.js";
+import type { UsagePoller } from "./poller.js";
 
 export type NotifyLevel = "info" | "warning" | "error";
 
@@ -66,6 +69,14 @@ export interface RotatorCommandState {
 	publisher?: RouterPublisher | undefined;
 	/** Reload the config from disk and republish; set by the extension shell. */
 	refresh?: (() => void) | undefined;
+	/** The single process-wide usage poller, registered by the extension shell on
+	 *  `session_start`. Lives in shared state so `/reload` cannot create a
+	 *  second one; the shell reads the CURRENT router through its `getTargets`. */
+	poller?: UsagePoller | undefined;
+	/** In-memory-only timestamps of the last ineffective status probe per profile.
+	 *  Never persisted: it exists to stop a persistently broken token from
+	 *  spawning a CLI probe on every `status` inside the backoff window. */
+	statusProbeAtMs?: Record<string, number> | undefined;
 }
 
 /** Injected login driver: spawns `claude auth login` for one profile and
@@ -74,6 +85,14 @@ export type StartLogin = (options: {
 	configDir: string;
 	onOutput?: ((line: string) => void) | undefined;
 }) => Promise<ClaudeLoginHandle>;
+
+/** Injected plan-usage fetcher. The command only ever needs a config dir and an
+ *  optional abort signal; the default closes over the injected clock so token
+ *  expiry stays deterministic in tests. */
+export type FetchUsage = (options: {
+	configDir: string;
+	signal?: AbortSignal | undefined;
+}) => Promise<UsageFetchResult>;
 
 export interface RotatorCommandOptions {
 	state: RotatorCommandState;
@@ -88,6 +107,8 @@ export interface RotatorCommandOptions {
 	startLogin?: StartLogin | undefined;
 	/** Copies the existing config aside before a wizard overwrite; tests inject. */
 	backupConfigFile?: ((path: string) => void) | undefined;
+	/** Defaults to the real `fetchPlanUsage`; tests inject a fake. */
+	fetchUsage?: FetchUsage | undefined;
 }
 
 export type RotatorCommandHandler = (args: string, ctx: RotatorCommandContext) => Promise<void>;
@@ -103,13 +124,15 @@ export function createRotatorCommandHandler(options: RotatorCommandOptions): Rot
 	const resolveHost = options.resolveHost ?? resolveBridgeAccountHost;
 	const startLogin = options.startLogin ?? startClaudeLogin;
 	const backupConfigFile = options.backupConfigFile ?? ((path: string) => copyFileSync(path, `${path}.bak`));
+	const fetchUsage: FetchUsage = options.fetchUsage
+		?? ((usageOptions) => fetchPlanUsage({ configDir: usageOptions.configDir, now, signal: usageOptions.signal }));
 
 	return async (args, ctx) => {
 		const parsed = parseArgs(args);
 		switch (parsed.subcommand) {
 			case "":
 			case "status":
-				runStatus(options.state, ctx, { globalTarget, now, resolveHost });
+				await runStatus(options.state, ctx, { globalTarget, now, resolveHost, fetchUsage });
 				return;
 			case "login":
 				await runLogin(options.state, ctx, parsed.argument, {
@@ -126,7 +149,7 @@ export function createRotatorCommandHandler(options: RotatorCommandOptions): Rot
 				runReset(options.state, ctx, parsed.argument);
 				return;
 			case "probe":
-				await runProbe(options.state, ctx, parsed.argument, { globalTarget, resolveHost });
+				await runProbe(options.state, ctx, parsed.argument, { globalTarget, resolveHost, now, fetchUsage });
 				return;
 			default:
 				ctx.ui.notify(
@@ -142,13 +165,24 @@ interface StatusDeps {
 	globalTarget: GlobalTarget;
 	now: () => number;
 	resolveHost: (globalTarget: GlobalTarget) => ClaudeBridgeAccountHostV1 | undefined;
+	fetchUsage: FetchUsage;
 }
 
-function runStatus(state: RotatorCommandState, ctx: RotatorCommandContext, deps: StatusDeps): void {
+/** Deadline passed to the bridge's `probeProfile` when status uses a probe to
+ *  give the official CLI a chance to refresh an expired access token. */
+const PROBE_REFRESH_DEADLINE_MS = 15000;
+
+/** A status probe that does not fix the token is not retried for this long, so
+ *  a persistently unauthorized account cannot spawn a CLI child on every
+ *  `status` invocation. In-memory and per process (shared command state). */
+export const STATUS_PROBE_BACKOFF_MS = 10 * 60_000;
+
+async function runStatus(state: RotatorCommandState, ctx: RotatorCommandContext, deps: StatusDeps): Promise<void> {
 	const config = state.config;
 	const router = state.router;
 	const published = deps.globalTarget[CLAUDE_ACCOUNT_ROUTER_SYMBOL] !== undefined;
-	const hostPresent = deps.resolveHost(deps.globalTarget) !== undefined;
+	const host = deps.resolveHost(deps.globalTarget);
+	const hostPresent = host !== undefined;
 
 	const lines: string[] = [];
 	lines.push(`pi-claude-bridge-rotator — policy: ${config?.policy ?? "unavailable"}`);
@@ -166,12 +200,42 @@ function runStatus(state: RotatorCommandState, ctx: RotatorCommandContext, deps:
 	const store = router.stateStore;
 	const nowMs = deps.now();
 
+	// Every profile is polled in parallel: status must stay one round trip slow,
+	// not one per account. The default fetcher never throws. When a token is
+	// expired or unauthorized and the bridge host is present, give the official
+	// CLI exactly ONE chance to refresh it (a probe under that config dir), then
+	// re-fetch once. The rotator itself never touches credentials.
+	const cwd = ctx.cwd !== undefined && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
+	const results = await Promise.all(config.profiles.map(async (profile) => {
+		const first = await deps.fetchUsage({ configDir: profile.configDir });
+		const needsRefresh = !first.ok && (first.reason === "token-expired" || first.reason === "unauthorized");
+		if (!needsRefresh || host === undefined) return first;
+		// A probe that just ran and did not fix the token is skipped until the
+		// backoff elapses; the plain fetch above still ran, so status stays fresh.
+		if (isStatusProbeBackedOff(state, profile.id, nowMs)) return first;
+		await probeProfileQuietly(host, profile, cwd);
+		const second = await deps.fetchUsage({ configDir: profile.configDir });
+		if (!second.ok && (second.reason === "token-expired" || second.reason === "unauthorized")) {
+			recordIneffectiveStatusProbe(state, profile.id, nowMs);
+		}
+		return second;
+	}));
+	config.profiles.forEach((profile, index) => {
+		const result = results[index];
+		if (result !== undefined) router.recordPlanUsage(profile.id, result);
+	});
+
 	for (const profile of config.profiles) {
 		const isCurrent = current?.profileId === profile.id;
 		lines.push("");
 		lines.push(`• ${profile.label} (${profile.id})${isCurrent ? "  ← current route" : ""}`);
 		lines.push(`  configDir: ${profile.configDir}`);
 		lines.push(`  cooldown: ${cooldownLabel(store, profile.id, nowMs)}`);
+		const usageRecord = router.planUsage(profile.id);
+		const usageLine = formatUsageLine(usageRecord, profile.id, nowMs);
+		if (usageLine !== undefined) lines.push(`  ${usageLine}`);
+		const lastKnownLine = formatLastKnownLine(usageRecord, nowMs);
+		if (lastKnownLine !== undefined) lines.push(`  ${lastKnownLine}`);
 		if (store.state.invalid.includes(profile.id)) {
 			lines.push(`  invalid: needs relogin — run /claude-accounts login ${profile.id}`);
 		}
@@ -180,6 +244,36 @@ function runStatus(state: RotatorCommandState, ctx: RotatorCommandContext, deps:
 	}
 
 	ctx.ui.notify(lines.join("\n"), "info");
+}
+
+/** One bounded probe whose only purpose is to let the official CLI refresh the
+ *  access token under that config dir. Any failure is swallowed: the following
+ *  re-fetch decides the reported reason. */
+async function probeProfileQuietly(
+	host: ClaudeBridgeAccountHostV1,
+	profile: RotatorProfileConfig,
+	cwd: string,
+): Promise<void> {
+	try {
+		await host.probeProfile({
+			profile: { profileId: profile.id, label: profile.label, configDir: profile.configDir },
+			cwd,
+			deadlineMs: PROBE_REFRESH_DEADLINE_MS,
+		});
+	} catch {
+		// Never throws: a probe failure must not change the reported reason.
+	}
+}
+
+function isStatusProbeBackedOff(state: RotatorCommandState, profileId: string, nowMs: number): boolean {
+	const lastProbeMs = state.statusProbeAtMs?.[profileId];
+	return lastProbeMs !== undefined && nowMs - lastProbeMs < STATUS_PROBE_BACKOFF_MS;
+}
+
+function recordIneffectiveStatusProbe(state: RotatorCommandState, profileId: string, nowMs: number): void {
+	const existing = state.statusProbeAtMs;
+	if (existing === undefined) state.statusProbeAtMs = { [profileId]: nowMs };
+	else existing[profileId] = nowMs;
 }
 
 interface LoginDeps {
@@ -399,6 +493,7 @@ async function probeIdentity(
 		const result = await host.probeProfile({
 			profile: { profileId: profile.id, label: profile.label, configDir: profile.configDir },
 			cwd,
+			deadlineMs: PROBE_REFRESH_DEADLINE_MS,
 		});
 		const identity = result.identity;
 		if (identity === undefined || !hasIdentity(identity)) return undefined;
@@ -476,6 +571,8 @@ function runReset(state: RotatorCommandState, ctx: RotatorCommandContext, argume
 interface ProbeDeps {
 	globalTarget: GlobalTarget;
 	resolveHost: (globalTarget: GlobalTarget) => ClaudeBridgeAccountHostV1 | undefined;
+	now: () => number;
+	fetchUsage: FetchUsage;
 }
 
 async function runProbe(
@@ -500,26 +597,36 @@ async function runProbe(
 
 	const cwd = ctx.cwd !== undefined && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
 	const router = state.router;
+	const nowMs = deps.now();
 	const lines: string[] = [`Probing ${targets.length} profile(s)…`];
 
 	for (const profile of targets) {
+		let identityText: string;
 		try {
 			const result = await host.probeProfile({
 				profile: { profileId: profile.id, label: profile.label, configDir: profile.configDir },
 				cwd,
+				deadlineMs: PROBE_REFRESH_DEADLINE_MS,
 			});
 			const identity = result.identity;
 			if (identity === undefined || !hasIdentity(identity)) {
 				// An empty result is a normal deadline/empty-probe outcome, not an error.
-				lines.push(`• ${profile.label} (${profile.id}): no identity reported`);
-				continue;
+				identityText = "no identity reported";
+			} else {
+				router?.recordIdentity(profile.id, toIdentity(identity));
+				identityText = formatIdentity(identity);
 			}
-			router?.recordIdentity(profile.id, toIdentity(identity));
-			lines.push(`• ${profile.label} (${profile.id}): ${formatIdentity(identity)}${formatUsage(result.usage)}`);
 		} catch (error) {
 			// One profile failing must not abort the others.
-			lines.push(`• ${profile.label} (${profile.id}): probe failed — ${describeError(error)}`);
+			identityText = `probe failed — ${describeError(error)}`;
 		}
+		// The probe has just run the official CLI under this config dir, so a fresh
+		// usage poll (same seam status uses) can see a refreshed access token.
+		const usageResult = await deps.fetchUsage({ configDir: profile.configDir });
+		router?.recordPlanUsage(profile.id, usageResult);
+		const usageLine = formatUsageLine(router?.planUsage(profile.id), profile.id, nowMs);
+		const usageSuffix = usageLine !== undefined ? ` · ${usageLine}` : "";
+		lines.push(`• ${profile.label} (${profile.id}): ${identityText}${usageSuffix}`);
 	}
 
 	ctx.ui.notify(lines.join("\n"), "info");
@@ -570,12 +677,18 @@ function cooldownLabel(store: RotatorStateStore, profileId: string, nowMs: numbe
 	return `remaining ${formatDuration(cooldown.untilMs - nowMs)} (${cooldown.rateLimitType})`;
 }
 
+/** Human duration: minutes below an hour, hours below a day, days above it.
+ *  Output for the minute/hour ranges must stay stable; existing callers and
+ *  tests depend on `5m`, `2h`, and `2h10m`. */
 function formatDuration(ms: number): string {
 	const minutes = Math.max(1, Math.ceil(ms / 60_000));
 	if (minutes < 60) return `${minutes}m`;
 	const hours = Math.floor(minutes / 60);
-	const rest = minutes % 60;
-	return rest === 0 ? `${hours}h` : `${hours}h${rest}m`;
+	const restMinutes = minutes % 60;
+	if (hours < 24) return restMinutes === 0 ? `${hours}h` : `${hours}h${restMinutes}m`;
+	const days = Math.floor(hours / 24);
+	const restHours = hours % 24;
+	return restHours === 0 ? `${days}d` : `${days}d${restHours}h`;
 }
 
 function formatIdentity(identity: {
@@ -590,15 +703,86 @@ function formatIdentity(identity: {
 	return parts.length > 0 ? parts.join(" · ") : "unknown";
 }
 
-function formatUsage(usage: unknown): string {
-	if (usage === undefined || usage === null) return "";
-	let text: string;
-	try {
-		text = JSON.stringify(usage) ?? String(usage);
-	} catch {
-		text = String(usage);
+// --- Plan-usage rendering ---------------------------------------------------
+
+const USAGE_WINDOW_LABELS: Record<UsageWindowName, string> = {
+	five_hour: "5h",
+	seven_day: "weekly",
+	seven_day_opus: "opus",
+	seven_day_sonnet: "sonnet",
+};
+
+/** Render one usage window. `withResets` is false for the `last known …` line,
+ *  which shows values only. A 5-hour window that has not started has no reset
+ *  time, so it is labeled explicitly. */
+function formatUsageWindow(
+	name: UsageWindowName,
+	window: UsageWindow,
+	nowMs: number,
+	withResets: boolean,
+): string {
+	const label = USAGE_WINDOW_LABELS[name];
+	const percent = window.utilization === null ? "n/a" : `${window.utilization}%`;
+	if (!withResets) return `${label} ${percent}`;
+	if (name === "five_hour" && window.resetsAtMs === null) return `${label} ${percent} (window not started)`;
+	if (window.resetsAtMs === null) return `${label} ${percent}`;
+	return `${label} ${percent} (resets in ${formatDuration(window.resetsAtMs - nowMs)})`;
+}
+
+/** Ordered `5h · weekly · opus · sonnet` summary. Opus/sonnet appear only when
+ *  their window is present AND carries a utilization number. */
+function formatUsageWindows(
+	windows: Partial<Record<UsageWindowName, UsageWindow>>,
+	nowMs: number,
+	withResets: boolean,
+): string {
+	const parts: string[] = [];
+	for (const name of ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"] as const) {
+		const window = windows[name];
+		if (window === undefined) continue;
+		if ((name === "seven_day_opus" || name === "seven_day_sonnet") && window.utilization === null) continue;
+		parts.push(formatUsageWindow(name, window, nowMs, withResets));
 	}
-	return ` · usage: ${text.length > 240 ? `${text.slice(0, 237)}…` : text}`;
+	return parts.join(" · ") || "no usage windows reported";
+}
+
+/** First plan-usage line for a profile: the success summary or the failure
+ *  reason. `undefined` when nothing was recorded. */
+function formatUsageLine(
+	record: ProfileUsageRecord | undefined,
+	profileId: string,
+	nowMs: number,
+): string | undefined {
+	if (record === undefined) return undefined;
+	if (record.lastError !== undefined) return `usage: unavailable — ${usageFailureText(record.lastError, profileId)}`;
+	if (record.snapshot === undefined) return undefined;
+	return `usage: ${formatUsageWindows(record.snapshot.windows, nowMs, true)}`;
+}
+
+/** Continuation line shown when a refresh failed but a snapshot exists. */
+function formatLastKnownLine(record: ProfileUsageRecord | undefined, nowMs: number): string | undefined {
+	if (record?.lastError === undefined || record.snapshot === undefined) return undefined;
+	const age = formatDuration(Math.max(0, nowMs - record.snapshot.fetchedAtMs));
+	return `  last known ${age} ago: ${formatUsageWindows(record.snapshot.windows, nowMs, false)}`;
+}
+
+function usageFailureText(error: ProfileUsageError, profileId: string): string {
+	switch (error.reason) {
+		case "no-credentials":
+			return `no credentials — run /claude-accounts login ${profileId}`;
+		case "token-expired":
+			return `access token expired — use this account once, or run /claude-accounts probe ${profileId}`;
+		case "unauthorized":
+			return `unauthorized — run /claude-accounts login ${profileId} if this persists`;
+		case "http-error":
+			return `usage endpoint returned HTTP ${error.httpStatus ?? "?"}`;
+		case "network":
+			return "network error";
+		case "timeout":
+			return "timed out after 5s";
+		case "malformed":
+			return "unexpected usage response";
+	}
 }
 
 type ProbeIdentity = NonNullable<

@@ -12,14 +12,16 @@ import type { RotatorConfig } from "../src/config.js";
 import { CLAUDE_ACCOUNT_ROUTER_SYMBOL, ClaudeAccountRouter } from "../src/router.js";
 import { RotatorStateStore } from "../src/state.js";
 import type { ClaudeBridgeAccountHostV1, GlobalTarget } from "../src/host.js";
-import { createRotatorCommandHandler } from "../src/commands.js";
+import { createRotatorCommandHandler, STATUS_PROBE_BACKOFF_MS } from "../src/commands.js";
 import type {
+	FetchUsage,
 	NotifyLevel,
 	RotatorCommandContext,
 	RotatorCommandState,
 	RotatorUIContext,
 	StartLogin,
 } from "../src/commands.js";
+import type { UsageFetchResult, UsageSnapshot } from "../src/usage.js";
 
 afterEach(cleanupTempDirs);
 
@@ -52,6 +54,7 @@ interface HarnessOptions {
 	configPath?: string | undefined;
 	env?: NodeJS.ProcessEnv | undefined;
 	onRefresh?: (() => void) | undefined;
+	fetchUsage?: FetchUsage | undefined;
 }
 
 function harness(config: RotatorConfig, options: HarnessOptions = {}): Harness {
@@ -76,6 +79,8 @@ function harness(config: RotatorConfig, options: HarnessOptions = {}): Harness {
 		backupConfigFile: options.backupConfigFile,
 		configPath: options.configPath,
 		env: options.env,
+		// Hermetic default: no filesystem read and no network unless a test opts in.
+		fetchUsage: options.fetchUsage ?? (async () => ({ ok: false, reason: "no-credentials" })),
 	});
 	const run = async (args: string, ctx: Omit<Partial<RotatorCommandContext>, "ui"> = {}): Promise<void> => {
 		await handler(args, {
@@ -232,6 +237,260 @@ describe("status", () => {
 	});
 });
 
+describe("status usage", () => {
+	const NOW = START_MS;
+	const DAY_MS = 24 * 60 * MINUTE_MS;
+
+	function successSnapshot(overrides: Partial<UsageSnapshot["windows"]> = {}): UsageSnapshot {
+		return {
+			fetchedAtMs: NOW,
+			windows: {
+				five_hour: { utilization: 12, resetsAtMs: NOW + 130 * MINUTE_MS },
+				seven_day: { utilization: 34, resetsAtMs: NOW + (3 * 24 * 60 + 4 * 60) * MINUTE_MS },
+				...overrides,
+			},
+		};
+	}
+
+	function snapshotFetch(snapshot: UsageSnapshot): FetchUsage {
+		return async () => ({ ok: true, snapshot });
+	}
+
+	it("renders the plan usage line right after cooldown", async () => {
+		const h = harness(twoProfileConfig(), { now: () => NOW, fetchUsage: snapshotFetch(successSnapshot()) });
+		await h.run("status");
+		expect(h.lastMessage()).toContain("  cooldown: ok\n  usage: 5h 12% (resets in 2h10m) · weekly 34% (resets in 3d4h)");
+	});
+
+	it("appends opus only when present and non-null, and labels an unstarted 5h window", async () => {
+		const snapshot: UsageSnapshot = {
+			fetchedAtMs: NOW,
+			windows: {
+				five_hour: { utilization: 0, resetsAtMs: null },
+				seven_day: { utilization: null, resetsAtMs: null },
+				seven_day_opus: { utilization: 7, resetsAtMs: null },
+				seven_day_sonnet: { utilization: null, resetsAtMs: null },
+			},
+		};
+		const h = harness(twoProfileConfig(), { now: () => NOW, fetchUsage: snapshotFetch(snapshot) });
+		await h.run("status");
+		expect(h.lastMessage()).toContain("usage: 5h 0% (window not started) · weekly n/a · opus 7%");
+		expect(h.lastMessage()).not.toContain("sonnet");
+	});
+
+	it("renders the failure reason and the last known values", async () => {
+		const h = harness(twoProfileConfig(), {
+			now: () => NOW,
+			fetchUsage: async () => ({ ok: false, reason: "network" }),
+		});
+		h.router.recordPlanUsage("a", { ok: true, snapshot: successSnapshot() });
+		await h.run("status");
+		expect(h.lastMessage()).toContain("usage: unavailable — network error");
+		expect(h.lastMessage()).toContain("last known 1m ago: 5h 12% · weekly 34%");
+	});
+
+	it.each([
+		[{ ok: false, reason: "no-credentials" } as UsageFetchResult, "no credentials — run /claude-accounts login a"],
+		[
+			{ ok: false, reason: "token-expired" } as UsageFetchResult,
+			"access token expired — use this account once, or run /claude-accounts probe a",
+		],
+		[
+			{ ok: false, reason: "unauthorized" } as UsageFetchResult,
+			"unauthorized — run /claude-accounts login a if this persists",
+		],
+		[{ ok: false, reason: "timeout" } as UsageFetchResult, "timed out after 5s"],
+		[{ ok: false, reason: "malformed" } as UsageFetchResult, "unexpected usage response"],
+	])("renders the reason text for %o", async (result, text) => {
+		const h = harness(twoProfileConfig(), { now: () => NOW, fetchUsage: async () => result });
+		await h.run("status");
+		expect(h.lastMessage()).toContain(`usage: unavailable — ${text}`);
+	});
+
+	it("renders the http-error reason with the status code", async () => {
+		const h = harness(twoProfileConfig(), {
+			now: () => NOW,
+			fetchUsage: async () => ({ ok: false, reason: "http-error", httpStatus: 503 }),
+		});
+		await h.run("status");
+		expect(h.lastMessage()).toContain("usage: unavailable — usage endpoint returned HTTP 503");
+	});
+
+	it("fetches every profile in parallel", async () => {
+		let active = 0;
+		let maxActive = 0;
+		let calls = 0;
+		const fetchUsage: FetchUsage = async () => {
+			calls += 1;
+			active += 1;
+			maxActive = Math.max(maxActive, active);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			active -= 1;
+			return { ok: false, reason: "network" };
+		};
+		const h = harness(twoProfileConfig(), { now: () => NOW, fetchUsage });
+		await h.run("status");
+		expect(calls).toBe(2);
+		expect(maxActive).toBe(2);
+	});
+
+	it("probes once with a 15s deadline and refetches when the token expired", async () => {
+		const probes: Array<{ profileId: string; deadlineMs: number | undefined }> = [];
+		const host: ClaudeBridgeAccountHostV1 = {
+			version: 1,
+			probeProfile: async ({ profile: route, deadlineMs }) => {
+				probes.push({ profileId: route.profileId, deadlineMs });
+				return {};
+			},
+		};
+		let calls = 0;
+		const fetchUsage: FetchUsage = async () => {
+			calls += 1;
+			return calls === 1 ? { ok: false, reason: "token-expired" } : { ok: true, snapshot: successSnapshot() };
+		};
+		const config: RotatorConfig = { policy: "balanced", path: "/tmp/rotator-config.json", profiles: [profile("a")] };
+		const h = harness(config, { now: () => NOW, host, fetchUsage });
+		await h.run("status");
+		expect(probes).toEqual([{ profileId: "a", deadlineMs: 15000 }]);
+		expect(calls).toBe(2);
+		expect(h.lastMessage()).toContain("usage: 5h 12%");
+	});
+
+	it("does not probe without a host and keeps the expired reason", async () => {
+		let calls = 0;
+		const fetchUsage: FetchUsage = async () => {
+			calls += 1;
+			return { ok: false, reason: "token-expired" };
+		};
+		const config: RotatorConfig = { policy: "balanced", path: "/tmp/rotator-config.json", profiles: [profile("a")] };
+		const h = harness(config, { now: () => NOW, fetchUsage });
+		await h.run("status");
+		expect(calls).toBe(1);
+		expect(h.lastMessage()).toContain("usage: unavailable — access token expired");
+	});
+
+	it("degrades when the refresh probe fails", async () => {
+		const host: ClaudeBridgeAccountHostV1 = {
+			version: 1,
+			probeProfile: async () => {
+				throw new Error("probe down");
+			},
+		};
+		let calls = 0;
+		const fetchUsage: FetchUsage = async () => {
+			calls += 1;
+			return { ok: false, reason: "token-expired" };
+		};
+		const config: RotatorConfig = { policy: "balanced", path: "/tmp/rotator-config.json", profiles: [profile("a")] };
+		const h = harness(config, { now: () => NOW, host, fetchUsage });
+		await h.run("status");
+		expect(calls).toBe(2);
+		expect(h.lastMessage()).toContain("usage: unavailable — access token expired");
+	});
+
+	it("renders multi-day durations", async () => {
+		const snapshot: UsageSnapshot = {
+			fetchedAtMs: NOW,
+			windows: { five_hour: { utilization: 12, resetsAtMs: NOW + 2 * DAY_MS } },
+		};
+		const h = harness(twoProfileConfig(), { now: () => NOW, fetchUsage: snapshotFetch(snapshot) });
+		// A cooldown is capped at 24h, so this exercises the `d` branch; the usage
+		// reset below exercises the `2d` branch with no cap in the way.
+		h.router.recordRateLimit("a", { resetsAt: (NOW + DAY_MS) / 1000 }, "m");
+		await h.run("status");
+		expect(h.lastMessage()).toContain("cooldown: remaining 1d (unknown)");
+		expect(h.lastMessage()).toContain("usage: 5h 12% (resets in 2d)");
+	});
+
+	it("probes and refetches when the token is unauthorized", async () => {
+		const probes: string[] = [];
+		const host: ClaudeBridgeAccountHostV1 = {
+			version: 1,
+			probeProfile: async ({ profile: route }) => {
+				probes.push(route.profileId);
+				return {};
+			},
+		};
+		let calls = 0;
+		const fetchUsage: FetchUsage = async () => {
+			calls += 1;
+			return calls === 1 ? { ok: false, reason: "unauthorized" } : { ok: true, snapshot: successSnapshot() };
+		};
+		const config: RotatorConfig = { policy: "balanced", path: "/tmp/rotator-config.json", profiles: [profile("a")] };
+		const h = harness(config, { now: () => NOW, host, fetchUsage });
+
+		await h.run("status");
+
+		expect(probes).toEqual(["a"]);
+		expect(calls).toBe(2);
+		expect(h.lastMessage()).toContain("usage: 5h 12%");
+	});
+
+	it("backs off a persistently ineffective probe and retries after the window", async () => {
+		const probes: string[] = [];
+		const host: ClaudeBridgeAccountHostV1 = {
+			version: 1,
+			probeProfile: async ({ profile: route }) => {
+				probes.push(route.profileId);
+				return {};
+			},
+		};
+		let calls = 0;
+		const fetchUsage: FetchUsage = async () => {
+			calls += 1;
+			return { ok: false, reason: "token-expired" };
+		};
+		let current = NOW;
+		const config: RotatorConfig = { policy: "balanced", path: "/tmp/rotator-config.json", profiles: [profile("a")] };
+		const h = harness(config, { now: () => current, host, fetchUsage });
+
+		await h.run("status");
+		expect(probes).toEqual(["a"]);
+		expect(calls).toBe(2);
+
+		// Within the backoff the plain fetch still runs, but no probe (and no refetch).
+		await h.run("status");
+		expect(probes).toEqual(["a"]);
+		expect(calls).toBe(3);
+
+		current += STATUS_PROBE_BACKOFF_MS;
+		await h.run("status");
+		expect(probes).toEqual(["a", "a"]);
+		expect(calls).toBe(5);
+	});
+
+	it("does not back off when the probe fixes the token", async () => {
+		const probes: string[] = [];
+		const host: ClaudeBridgeAccountHostV1 = {
+			version: 1,
+			probeProfile: async ({ profile: route }) => {
+				probes.push(route.profileId);
+				return {};
+			},
+		};
+		const scripted: UsageFetchResult[] = [
+			{ ok: false, reason: "token-expired" },
+			{ ok: true, snapshot: successSnapshot() },
+			{ ok: false, reason: "token-expired" },
+			{ ok: true, snapshot: successSnapshot() },
+		];
+		let index = 0;
+		const fetchUsage: FetchUsage = async () => {
+			const result = scripted[Math.min(index, scripted.length - 1)];
+			index += 1;
+			return result ?? { ok: false, reason: "network" };
+		};
+		const config: RotatorConfig = { policy: "balanced", path: "/tmp/rotator-config.json", profiles: [profile("a")] };
+		const h = harness(config, { now: () => NOW, host, fetchUsage });
+
+		await h.run("status");
+		await h.run("status");
+
+		// A successful refetch is not a backoff: the next failure probes again.
+		expect(probes).toEqual(["a", "a"]);
+	});
+});
+
 describe("login", () => {
 	it("prepares a CLAUDE_CONFIG_DIR login command for every profile", async () => {
 		const h = harness(twoProfileConfig());
@@ -308,6 +567,30 @@ describe("login wizard", () => {
 		expect(h.store.state.identity.a?.email).toBe("a@example.com");
 		// Existing profiles are never rewritten.
 		expect(existsSync(configPath)).toBe(false);
+	});
+
+	it("passes a 15s deadline to the post-login identity probe", async () => {
+		const { configPath, env } = wizardContext();
+		const dialogs = scriptedDialogs({ selectResponses: ["A"], inputResponses: ["123456"] });
+		const deadlines: Array<number | undefined> = [];
+		const host: ClaudeBridgeAccountHostV1 = {
+			version: 1,
+			probeProfile: async ({ deadlineMs }) => {
+				deadlines.push(deadlineMs);
+				return { identity: { email: "a@example.com" } };
+			},
+		};
+		const h = harness(twoProfileConfig(), {
+			ui: dialogs.ui,
+			startLogin: fakeLogin().startLogin,
+			configPath,
+			env,
+			host,
+		});
+
+		await h.run("login");
+
+		expect(deadlines).toEqual([15000]);
 	});
 
 	it("creates a new profile, writes the config, refreshes, and logs in", async () => {
@@ -672,6 +955,31 @@ describe("probe", () => {
 		const h = harness(twoProfileConfig(), { host });
 		await h.run("probe b");
 		expect(calls).toEqual(["b"]);
+	});
+
+	it("shows the plan usage line after probing", async () => {
+		const { host } = hostProbe({ a: { identity: { email: "a@example.com" } } });
+		const snapshot: UsageSnapshot = {
+			fetchedAtMs: START_MS,
+			windows: { five_hour: { utilization: 12, resetsAtMs: null } },
+		};
+		const h = harness(twoProfileConfig(), { host, fetchUsage: async () => ({ ok: true, snapshot }) });
+		await h.run("probe a");
+		expect(h.lastMessage()).toContain("a@example.com · usage: 5h 12% (window not started)");
+	});
+
+	it("passes a 15s deadline to probeProfile", async () => {
+		const deadlines: Array<number | undefined> = [];
+		const host: ClaudeBridgeAccountHostV1 = {
+			version: 1,
+			probeProfile: async ({ deadlineMs }) => {
+				deadlines.push(deadlineMs);
+				return { identity: { email: "a@example.com" } };
+			},
+		};
+		const h = harness(twoProfileConfig(), { host });
+		await h.run("probe a");
+		expect(deadlines).toEqual([15000]);
 	});
 });
 

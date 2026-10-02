@@ -96,19 +96,84 @@ All management goes through a single `/claude-accounts` command:
 
 | Command | Effect |
 | --- | --- |
-| `/claude-accounts` | Same as `status`; shows policy, published state, and per-profile cooldown, invalid flag, and cached identity. |
-| `/claude-accounts status` | Status report; also explains a broken config. |
+| `/claude-accounts` | Same as `status`; shows policy, published state, and per-profile cooldown, plan usage, invalid flag, and cached identity. |
+| `/claude-accounts status` | Status report; polls each account's plan usage and also explains a broken config. |
 | `/claude-accounts login [profile]` | Interactive wizard: pick or add an account, sign in via the browser, paste the code into a pi dialog, and the command writes the config. `[profile]` logs in that profile; an argument that matches nothing offers to create it. Falls back to printing `CLAUDE_CONFIG_DIR=<dir> claude auth login --claudeai` when pi has no dialogs. |
 | `/claude-accounts reset [profile]` | Clears cooldowns and invalid flags for the target profile(s); affinity and identity are kept. |
-| `/claude-accounts probe [profile]` | Reads account identity from the bridge's account host and refreshes the identity cache. |
+| `/claude-accounts probe [profile]` | Reads account identity from the bridge's account host and polls plan usage. |
 
 `[profile]` accepts a profile id or label; omitting it targets every profile.
 
+### Plan usage in `status`
+
+`status` polls each account's real subscription usage and prints a `usage:` line
+right below its cooldown:
+
+```text
+• Personal (personal)
+  configDir: /home/you/.claude-rotator/personal
+  cooldown: ok
+  usage: 5h 12% (resets in 2h10m) · weekly 34% (resets in 3d4h)
+```
+
+- `5h` is the rolling 5-hour window, `weekly` the 7-day window. `opus` and
+  `sonnet` are appended only when the account reports those model-scoped
+  windows. A value the endpoint does not report renders as `n/a`; a 5-hour
+  window that has not opened yet renders as `5h 0% (window not started)`.
+- Every profile is polled in parallel with a 5-second timeout, so `status`
+  stays a single round trip even with several accounts.
+- When a poll fails, the line reads `usage: unavailable — <reason>` and, if a
+  previous snapshot exists, a second `last known <age> ago: …` line shows how
+  fresh that data is.
+
+All requests are read-only and go straight from the rotator to
+`https://api.anthropic.com/api/oauth/usage`. The rotator reads only
+`claudeAiOauth.accessToken` and `claudeAiOauth.expiresAt` out of the profile's
+`.credentials.json`; the token is never logged, persisted, or included in an
+error. **The rotator never refreshes, writes, or rotates tokens** — refresh
+tokens rotate, and racing the official CLI could invalidate a login. An expired
+access token is refreshed by the Claude CLI the next time that account is used;
+if `status` finds an expired or unauthorized token it gives the CLI one bounded
+probe (15 s) to refresh, then polls once more.
+
 ## How rotation works
 
-- **Balanced by session**: every new session is routed round-robin over the
-  eligible profiles; within a session, requests stick to its profile so Claude
-  Code `--resume` keeps working (the bridge needs the exact `configDir`).
+- **Usage-aware ranking for new sessions**: the router ranks the eligible
+  profiles from their cached plan-usage snapshot and sends a new session to the
+  best one. The score rewards *weekly headroom* (the expected use for how far
+  the 7-day window has elapsed, minus actual use) plus a small "use it or lose
+  it" bonus for 5-hour headroom that resets within the hour, and subtracts a
+  penalty for current 5-hour use. Hard caps — 5-hour utilization ≥ 95 % or
+  weekly utilization ≥ 98 % — move an account to the back of the order as a
+  last resort. Accounts with no snapshot, or one older than 15 minutes, are
+  treated as unknown and placed between the healthy and the capped ones. Ties
+  keep the configured profile order, so the choice is fully deterministic:
+  the same inputs always produce the same route.
+- **Per-session spread between refreshes**: ranking alone would send every new
+  session to the same best account until the next snapshot. Each new
+  (non-affinity) session routed to a profile adds a small in-memory score
+  penalty to that profile, so new sessions spread across the healthy accounts.
+  The count resets as soon as a newer snapshot arrives, never applies in
+  round-robin mode, and never overrides the hard caps.
+- **Round-robin fallback**: until the first snapshot arrives (or when every
+  snapshot is stale), ranking degrades to the cursor round-robin over the
+  eligible profiles, so rotation is never worse than it was before.
+- **Background refresh**: one poller per process refreshes every account's usage
+  every 5 minutes, plus once more after a successful request (at most once per
+  account per minute). Routing itself reads only the cached snapshot: `acquire`
+  is synchronous and never fetches, so a slow endpoint can never stall a turn.
+- **Cache-aware session affinity**: a session normally stays on its account so
+  Claude Code `--resume` keeps working (the bridge needs the exact `configDir`).
+  Because prompt caches are isolated per organization and Claude Code uses a
+  1-hour cache TTL, moving a session always costs one cold cache rebuild, so the
+  router moves it only when the move is worth that cost: when the bound account
+  is ineligible (cooling down, invalid, or excluded); when it is at a hard cap
+  (5-hour ≥ 95 % or weekly ≥ 98 %) and another eligible account is not; or when
+  it is over a soft threshold (5-hour ≥ 85 % or weekly ≥ 90 %) **and** the
+  session has been idle for at least 1 hour, so its cache is already cold. An
+  unknown last-use time counts as still warm, so the session stays. A move
+  behaves like a normal ranked pick and rebinds the session; staying does not
+  disturb the round-robin cursor.
 - **Cooldowns**: a rate-limited account stops receiving traffic until the
   upstream reset time (or a 30-minute default when the payload carries no
   reset); all traffic goes to the remaining account(s). The bridge's retry loop
@@ -119,8 +184,10 @@ All management goes through a single `/claude-accounts` command:
   reset time, which the bridge surfaces as a clear error.
 
 State lives in `~/.pi/agent/claude-bridge-rotator-state.json` (0600, atomic
-writes): cooldowns, invalid set, session affinity (pruned to the last 200
-sessions), and a cached identity per profile for display.
+writes): cooldowns, invalid set, session affinity and its paired last-use
+timestamps (pruned together to the last 200 sessions), a cached identity per
+profile, and a normalized plan-usage snapshot (plus the last failure reason)
+per profile.
 
 ## Troubleshooting
 
@@ -130,8 +197,27 @@ sessions), and a cached identity per profile for display.
 - **`status` shows a config error** — fix the JSON; the next `/reload`
   republishes. `/claude-accounts login` can also recreate the file.
 - **`probe` reports no identity** — the account is not logged in, or the
-  bridge's 10s probe deadline hit an empty response; run
+  bridge's probe deadline hit an empty response; run
   `/claude-accounts login` first.
+- **`usage: unavailable — no credentials — run /claude-accounts login <id>`** —
+  there is no readable `.credentials.json` under that profile's config dir.
+  Log that account in.
+- **`usage: unavailable — access token expired …`** — the access token's
+  recorded expiry has passed. Use the account once from Claude Code (or run
+  `/claude-accounts probe <id>`) so the official CLI refreshes it, then run
+  `status` again. The rotator deliberately never refreshes it itself.
+- **`usage: unavailable — unauthorized …`** — the endpoint rejected the token
+  (HTTP 401/403). If it persists after the account is used again, run
+  `/claude-accounts login <id>`.
+- **`usage: unavailable — usage endpoint returned HTTP <n>`** — the usage
+  endpoint answered with an unexpected status; retry, and check Anthropic
+  status if it keeps failing.
+- **`usage: unavailable — network error`** — the request could not reach the
+  endpoint. Check connectivity.
+- **`usage: unavailable — timed out after 5s`** — the endpoint did not answer
+  within the 5-second budget. Retry.
+- **`usage: unavailable — unexpected usage response`** — the response was not
+  JSON or had an unexpected shape. Usually transient.
 - **The browser does not open** — copy the URL from the notification into your
   browser, then paste the code into the pi dialog as usual.
 - **`claude CLI not found on PATH`** — install Claude Code so the `claude`
@@ -143,8 +229,8 @@ sessions), and a cached identity per profile for display.
 
 ## Non-goals (v1)
 
-Model-scoped quota rotation (`route.modelId`), quota-aware probing for
-selection, auto-detection of profiles, and multi-policy runtime switching.
+Model-scoped quota rotation (`route.modelId`), auto-detection of profiles, and
+multi-policy runtime switching.
 
 ## License
 

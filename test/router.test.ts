@@ -16,6 +16,7 @@ import {
 	resetTimestampMs,
 } from "../src/router.js";
 import type { ClaudeAccountAcquireInput, ClaudeAccountFailureKind, ClaudeAccountRouterV1 } from "../src/router.js";
+import type { UsageFetchResult } from "../src/usage.js";
 
 afterEach(cleanupTempDirs);
 
@@ -32,7 +33,11 @@ interface Harness {
 	warnings: string[];
 }
 
-function harness(profiles: RotatorProfileConfig[], startMs = START_MS): Harness {
+function harness(
+	profiles: RotatorProfileConfig[],
+	startMs = START_MS,
+	options: { onRequestSucceeded?: ((profileId: string) => void) | undefined } = {},
+): Harness {
 	const dir = makeTempDir();
 	const storePath = join(dir, "state.json");
 	let currentMs = startMs;
@@ -44,6 +49,7 @@ function harness(profiles: RotatorProfileConfig[], startMs = START_MS): Harness 
 		state: store,
 		now,
 		onWarn: (message) => warnings.push(message),
+		onRequestSucceeded: options.onRequestSucceeded,
 	});
 	return {
 		router,
@@ -458,6 +464,19 @@ describe("session reporting and profile resolution", () => {
 		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
 	});
 
+	it("writes the paired last-use timestamp with the injected clock", () => {
+		const { router, store, advance } = harness([profile("a")]);
+
+		router.recordSuccess("a", "s1");
+		expect(store.state.sessionLastUsedAtMs.s1).toBe(START_MS);
+
+		advance(5 * MINUTE_MS);
+		router.recordSuccess("a", "s1");
+
+		expect(store.state.sessionLastUsedAtMs.s1).toBe(START_MS + 5 * MINUTE_MS);
+		expect(Object.keys(store.state.sessionLastUsedAtMs)).toEqual(["s1"]);
+	});
+
 	it("ignores recordSuccess without a session id", () => {
 		const { router, store } = harness([profile("a")]);
 
@@ -541,6 +560,73 @@ describe("session reporting and profile resolution", () => {
 	});
 });
 
+describe("plan usage records", () => {
+	const snapshot = {
+		fetchedAtMs: START_MS,
+		windows: { five_hour: { utilization: 12, resetsAtMs: START_MS + HOUR_MS } },
+	};
+
+	it("stores a successful snapshot and clears any previous error", () => {
+		const { router, store } = harness([profile("a")]);
+		router.recordPlanUsage("a", { ok: false, reason: "network" });
+		expect(store.state.usage.a?.lastError?.reason).toBe("network");
+
+		router.recordPlanUsage("a", { ok: true, snapshot });
+
+		expect(store.state.usage.a?.snapshot).toEqual(snapshot);
+		expect(store.state.usage.a?.lastError).toBeUndefined();
+	});
+
+	it("keeps the previous snapshot and records the failure", () => {
+		const { router, store } = harness([profile("a")]);
+		router.recordPlanUsage("a", { ok: true, snapshot });
+
+		router.recordPlanUsage("a", { ok: false, reason: "http-error", httpStatus: 503 });
+
+		expect(store.state.usage.a?.snapshot).toEqual(snapshot);
+		expect(store.state.usage.a?.lastError).toEqual({ reason: "http-error", atMs: START_MS, httpStatus: 503 });
+	});
+
+	it("records a failure without a snapshot", () => {
+		const { router, store } = harness([profile("a")]);
+
+		router.recordPlanUsage("a", { ok: false, reason: "token-expired" });
+
+		expect(store.state.usage.a?.snapshot).toBeUndefined();
+		expect(store.state.usage.a?.lastError).toEqual({ reason: "token-expired", atMs: START_MS });
+	});
+
+	it("ignores an unknown profile", () => {
+		const { router, store } = harness([profile("a")]);
+
+		router.recordPlanUsage("missing", { ok: true, snapshot });
+
+		expect(store.state.usage).toEqual({});
+	});
+
+	it("exposes the stored record through planUsage and never throws", () => {
+		const { router } = harness([profile("a")]);
+		expect(router.planUsage("missing")).toBeUndefined();
+
+		router.recordPlanUsage("a", { ok: true, snapshot });
+
+		expect(router.planUsage("a")?.snapshot).toEqual(snapshot);
+		expect(() => router.recordPlanUsage("a", undefined as never)).not.toThrow();
+		expect(() => router.recordPlanUsage("missing", undefined as never)).not.toThrow();
+	});
+
+	it("persists the usage record to disk", () => {
+		const { router, store } = harness([profile("a")]);
+
+		router.recordPlanUsage("a", { ok: true, snapshot });
+
+		const persisted = JSON.parse(readFileSync(store.path, "utf8")) as {
+			usage: Record<string, { snapshot?: { fetchedAtMs: number } }>;
+		};
+		expect(persisted.usage.a?.snapshot?.fetchedAtMs).toBe(START_MS);
+	});
+});
+
 describe("fault isolation", () => {
 	it("never throws from record*, current, or resolveProfile on bad input", () => {
 		const { router, store } = harness([profile("a")]);
@@ -587,5 +673,287 @@ describe("createRouter factory", () => {
 		expect(router.version).toBe(1);
 		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("a");
 		expect(router.acquire({ modelId: "m", sessionId: "s2" }).profileId).toBe("b");
+	});
+
+	it("keeps both sessions when two routers share a state file", () => {
+		const dir = makeTempDir();
+		const statePath = join(dir, "state.json");
+		const config: RotatorConfig = {
+			policy: "balanced",
+			path: join(dir, "claude-bridge-rotator.json"),
+			profiles: [profile("a"), profile("b")],
+		};
+		const first = createRouter(config, { statePath });
+		const second = createRouter(config, { statePath });
+
+		first.recordSuccess("a", "s1");
+		second.recordSuccess("b", "s2");
+
+		const reloaded = new RotatorStateStore({ statePath });
+		expect(reloaded.state.sessionAffinity).toEqual({ s1: "a", s2: "b" });
+	});
+});
+
+describe("usage-aware ranking", () => {
+	const DAY_MS = 24 * HOUR_MS;
+
+	function fresh(weeklyUtil: number, fiveHourUtil = 0): { ok: true; snapshot: { fetchedAtMs: number; windows: Record<string, { utilization: number; resetsAtMs: number | null }> } } {
+		return {
+			ok: true,
+			snapshot: {
+				fetchedAtMs: START_MS,
+				windows: {
+					five_hour: { utilization: fiveHourUtil, resetsAtMs: null },
+					seven_day: { utilization: weeklyUtil, resetsAtMs: START_MS + 3 * DAY_MS },
+				},
+			},
+		};
+	}
+
+	it("picks the profile with the most weekly headroom from a fresh snapshot", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", fresh(90));
+		router.recordPlanUsage("b", fresh(5));
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
+	});
+
+	it("falls back to round-robin when every snapshot is stale", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		const stale = {
+			ok: true as const,
+			snapshot: { fetchedAtMs: START_MS - 60 * MINUTE_MS, windows: {} },
+		};
+		router.recordPlanUsage("a", stale);
+		router.recordPlanUsage("b", stale);
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("a");
+		expect(router.acquire({ modelId: "m", sessionId: "s2" }).profileId).toBe("b");
+	});
+
+	it("avoids a capped account", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", fresh(0, 96));
+		router.recordPlanUsage("b", fresh(10, 0));
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
+	});
+
+	it("honors exclusions on the ranked path", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", fresh(5));
+		router.recordPlanUsage("b", fresh(90));
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1", excludedProfileIds: ["a"] }).profileId).toBe("b");
+	});
+
+	it("sets the cursor past the ranked pick and affinity does not move it", () => {
+		const { router, store } = harness([profile("a"), profile("b"), profile("c")]);
+		router.recordPlanUsage("a", fresh(90));
+		router.recordPlanUsage("b", fresh(5));
+		router.recordPlanUsage("c", fresh(40));
+
+		// Ranking picks b (best headroom) regardless of the cursor; the cursor is
+		// advanced past b so a later round-robin fallback stays fair.
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
+		expect(store.state.cursor).toBe(2);
+		router.recordSuccess("b", "s1");
+
+		// An affinity hit changes nothing, cursor included.
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
+		expect(store.state.cursor).toBe(2);
+	});
+
+	it("routes the failover retry through the same ranking", () => {
+		const { router } = harness([profile("a"), profile("b"), profile("c")]);
+		router.recordPlanUsage("a", fresh(5));
+		router.recordPlanUsage("b", fresh(90));
+		router.recordPlanUsage("c", fresh(30));
+
+		const first = router.acquire({ modelId: "m", sessionId: "s1" });
+		expect(first.profileId).toBe("a");
+		const failover = router.acquire({
+			modelId: "m",
+			sessionId: "s1",
+			excludedProfileIds: [first.profileId],
+			forceRerank: true,
+			reason: "automatic-failover",
+		});
+		expect(failover.profileId).toBe("c");
+	});
+});
+
+describe("cache-aware affinity", () => {
+	const DAY_MS = 24 * HOUR_MS;
+
+	function freshAt(fetchedAtMs: number, weeklyUtil: number, fiveHourUtil = 0): UsageFetchResult {
+		return {
+			ok: true,
+			snapshot: {
+				fetchedAtMs,
+				windows: {
+					five_hour: { utilization: fiveHourUtil, resetsAtMs: null },
+					seven_day: { utilization: weeklyUtil, resetsAtMs: fetchedAtMs + 3 * DAY_MS },
+				},
+			},
+		};
+	}
+
+	it("keeps a bound session under both soft thresholds and does not advance the cursor", () => {
+		const { router, store } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", freshAt(START_MS, 20));
+		router.recordPlanUsage("b", freshAt(START_MS, 0));
+		router.recordSuccess("a", "s1");
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("a");
+		expect(store.state.cursor).toBe(0);
+	});
+
+	it("moves a bound session at the hard cap to the best non-capped profile and advances the cursor", () => {
+		const { router, store } = harness([profile("a"), profile("b"), profile("c")]);
+		router.recordPlanUsage("a", freshAt(START_MS, 0, 96));
+		router.recordPlanUsage("b", freshAt(START_MS, 10));
+		router.recordPlanUsage("c", freshAt(START_MS, 40));
+		router.recordSuccess("a", "s1");
+
+		const route = router.acquire({ modelId: "m", sessionId: "s1" });
+
+		expect(route.profileId).toBe("b");
+		// The move behaves like a ranked pick: the cursor lands past "b".
+		expect(store.state.cursor).toBe(2);
+		router.recordSuccess(route.profileId, "s1");
+		expect(store.state.sessionAffinity.s1).toBe("b");
+	});
+
+	it("moves over a soft threshold only after the 1-hour cache has gone cold", () => {
+		const { router, store, now, advance } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", freshAt(START_MS, 0, 90));
+		router.recordPlanUsage("b", freshAt(START_MS, 0));
+		router.recordSuccess("a", "s1");
+
+		// Warm cache: the session stays even though the account is over soft.
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("a");
+
+		// After an hour idle the poller has refreshed both snapshots; the cache is
+		// cold, so the move is free.
+		advance(60 * MINUTE_MS);
+		router.recordPlanUsage("a", freshAt(now(), 0, 90));
+		router.recordPlanUsage("b", freshAt(now(), 0));
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
+		router.recordSuccess("b", "s1");
+		expect(store.state.sessionAffinity.s1).toBe("b");
+	});
+
+	it("still bypasses affinity when the bound profile is ineligible, even under soft", () => {
+		const { router, now } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", freshAt(START_MS, 0, 10));
+		router.recordPlanUsage("b", freshAt(START_MS, 0));
+		router.recordSuccess("a", "s1");
+		router.recordRateLimit("a", { resetsAt: (now() + HOUR_MS) / 1000 }, "m");
+
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("b");
+	});
+});
+
+describe("new-session spread penalty", () => {
+	const DAY_MS = 24 * HOUR_MS;
+
+	function frozen(fetchedAtMs: number, weeklyUtil: number, fiveHourUtil = 0, resetsBaseMs = fetchedAtMs): UsageFetchResult {
+		return {
+			ok: true,
+			snapshot: {
+				fetchedAtMs,
+				windows: {
+					five_hour: { utilization: fiveHourUtil, resetsAtMs: null },
+					seven_day: { utilization: weeklyUtil, resetsAtMs: resetsBaseMs + 3 * DAY_MS },
+				},
+			},
+		};
+	}
+
+	it("spreads new sessions across equally ranked accounts deterministically", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", frozen(START_MS, 0));
+		router.recordPlanUsage("b", frozen(START_MS, 0));
+
+		const ids = ["s1", "s2", "s3", "s4"].map(
+			(sessionId) => router.acquire({ modelId: "m", sessionId }).profileId,
+		);
+
+		expect(ids).toEqual(["a", "b", "a", "b"]);
+	});
+
+	it("resets the spread once a newer snapshot arrives", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", frozen(START_MS, 0));
+		router.recordPlanUsage("b", frozen(START_MS, 0));
+		expect(router.acquire({ modelId: "m", sessionId: "s1" }).profileId).toBe("a");
+
+		// A fresh snapshot for "a" (same windows, newer `fetchedAtMs`) resets its
+		// count, so the next tie favors it again.
+		router.recordPlanUsage("a", frozen(START_MS + 1, 0, 0, START_MS));
+
+		expect(router.acquire({ modelId: "m", sessionId: "s2" }).profileId).toBe("a");
+	});
+
+	it("never lets the penalty override a hard cap", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+		router.recordPlanUsage("a", frozen(START_MS, 0));
+		router.recordPlanUsage("b", frozen(START_MS, 0, 96));
+
+		const ids = ["s1", "s2", "s3"].map(
+			(sessionId) => router.acquire({ modelId: "m", sessionId }).profileId,
+		);
+
+		expect(ids).toEqual(["a", "a", "a"]);
+	});
+
+	it("has no effect in round-robin mode", () => {
+		const { router } = harness([profile("a"), profile("b")]);
+
+		const ids = ["s1", "s2", "s3", "s4"].map(
+			(sessionId) => router.acquire({ modelId: "m", sessionId }).profileId,
+		);
+
+		expect(ids).toEqual(["a", "b", "a", "b"]);
+	});
+});
+
+describe("onRequestSucceeded", () => {
+	it("is invoked on every recorded success, session id or not", () => {
+		const calls: string[] = [];
+		const { router } = harness([profile("a"), profile("b")], START_MS, {
+			onRequestSucceeded: (profileId) => calls.push(profileId),
+		});
+
+		router.recordSuccess("a", "s1");
+		router.recordSuccess("b");
+
+		expect(calls).toEqual(["a", "b"]);
+	});
+
+	it("is ignored for an unknown profile", () => {
+		const calls: string[] = [];
+		const { router } = harness([profile("a")], START_MS, {
+			onRequestSucceeded: (profileId) => calls.push(profileId),
+		});
+
+		router.recordSuccess("missing", "s1");
+
+		expect(calls).toEqual([]);
+	});
+
+	it("is guarded so a throwing callback cannot break affinity", () => {
+		const { router, store, warnings } = harness([profile("a"), profile("b")], START_MS, {
+			onRequestSucceeded: () => {
+				throw new Error("refresh trigger down");
+			},
+		});
+
+		expect(() => router.recordSuccess("a", "s1")).not.toThrow();
+
+		expect(store.state.sessionAffinity.s1).toBe("a");
+		expect(warnings.some((message) => message.includes("onRequestSucceeded failed"))).toBe(true);
 	});
 });
