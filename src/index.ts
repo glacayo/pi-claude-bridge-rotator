@@ -80,7 +80,7 @@ export {
 } from "./host.js";
 export type { ClaudeBridgeAccountHostV1, GlobalTarget } from "./host.js";
 
-export { createRotatorCommandHandler } from "./commands.js";
+export { createRotatorCommandHandler, STATUS_PROBE_BACKOFF_MS } from "./commands.js";
 export type {
 	FetchUsage,
 	NotifyLevel,
@@ -92,6 +92,30 @@ export type {
 	RotatorUIContext,
 	StartLogin,
 } from "./commands.js";
+
+export {
+	FIVE_HOUR_BONUS_WINDOW_MS,
+	FIVE_HOUR_HARD_CAP,
+	rankProfiles,
+	SNAPSHOT_MAX_AGE_MS,
+	WEEK_MS,
+	WEEKLY_HARD_CAP,
+} from "./ranking.js";
+export type { RankedProfiles, RankProfilesInput, RankingMode } from "./ranking.js";
+
+export {
+	UsagePoller,
+	USAGE_POLL_INTERVAL_MS,
+	USAGE_REFRESH_THROTTLE_MS,
+} from "./poller.js";
+export type {
+	ClearIntervalFn,
+	SetIntervalFn,
+	SetTimeoutFn,
+	UsagePollerOptions,
+	UsagePollerRouter,
+	UsagePollerTarget,
+} from "./poller.js";
 
 export {
 	CREDENTIALS_FILENAME,
@@ -129,13 +153,16 @@ export type {
 } from "./login.js";
 
 import { createRotatorCommandHandler } from "./commands.js";
-import type { RotatorCommandState } from "./commands.js";
+import type { FetchUsage, RotatorCommandState } from "./commands.js";
 import { loadConfig } from "./config.js";
 import type { RotatorConfig } from "./config.js";
 import { DEFAULT_GLOBAL_TARGET, resolveBridgeAccountHost } from "./host.js";
 import type { GlobalTarget } from "./host.js";
+import { UsagePoller } from "./poller.js";
+import type { ClearIntervalFn, SetIntervalFn, SetTimeoutFn } from "./poller.js";
 import { CLAUDE_ACCOUNT_ROUTER_SYMBOL, ClaudeAccountRouter, createRouter } from "./router.js";
 import type { ClaudeAccountRouterV1 } from "./router.js";
+import { fetchPlanUsage } from "./usage.js";
 
 /** Build a router from the real on-disk config. */
 export function createRotatorFromDisk(): ClaudeAccountRouter {
@@ -197,6 +224,13 @@ export interface RotatorExtensionDeps {
 	configPath?: string | undefined;
 	env?: NodeJS.ProcessEnv | undefined;
 	now?: (() => number) | undefined;
+	/** Plan-usage fetch seam for the background poller; tests inject a fake. */
+	fetchUsage?: FetchUsage | undefined;
+	onWarn?: ((message: string) => void) | undefined;
+	/** Timer seams for the poller; tests inject fakes so no real timer runs. */
+	setIntervalFn?: SetIntervalFn | undefined;
+	clearIntervalFn?: ClearIntervalFn | undefined;
+	setTimeoutFn?: SetTimeoutFn | undefined;
 }
 
 /** Real extension wiring, separated from the default export so tests can inject
@@ -206,6 +240,7 @@ export interface RotatorExtensionDeps {
 export function activateExtension(pi: ExtensionAPI, deps: RotatorExtensionDeps = {}): void {
 	const globalTarget = deps.globalTarget ?? DEFAULT_GLOBAL_TARGET;
 	const state = commandStateFor(globalTarget);
+	const now = deps.now ?? (() => Date.now());
 
 	registerCommandOnce(pi, globalTarget, state, deps);
 
@@ -217,13 +252,20 @@ export function activateExtension(pi: ExtensionAPI, deps: RotatorExtensionDeps =
 	// and only the original owner may republish the process-global symbol.
 	if (state.publisher === undefined) state.publisher = publisher;
 
+	// Every router shares one after-request refresh trigger. It reads the poller
+	// off the shared state so a reloaded router still points at the live poller
+	// (and is a no-op before `session_start` creates it).
+	const onRequestSucceeded = (profileId: string): void => {
+		state.poller?.requestRefresh(profileId);
+	};
+
 	// Refresh hook shared across activations: reload the config from disk,
 	// rebuild the router, and republish through the stored owner. This is what
 	// makes a wizard-written profile live without `/reload`.
 	state.refresh = () => {
 		try {
 			const config: RotatorConfig = loadConfig({ configPath: deps.configPath, env: deps.env });
-			const router = createRouter(config, { env: deps.env, now: deps.now });
+			const router = createRouter(config, { env: deps.env, now: deps.now, onRequestSucceeded });
 			state.publisher?.publish(router);
 			state.config = config;
 			state.router = router;
@@ -239,7 +281,7 @@ export function activateExtension(pi: ExtensionAPI, deps: RotatorExtensionDeps =
 
 	try {
 		const config: RotatorConfig = loadConfig({ configPath: deps.configPath, env: deps.env });
-		const router = createRouter(config, { env: deps.env, now: deps.now });
+		const router = createRouter(config, { env: deps.env, now: deps.now, onRequestSucceeded });
 		state.config = config;
 		state.router = router;
 		state.configError = undefined;
@@ -251,6 +293,11 @@ export function activateExtension(pi: ExtensionAPI, deps: RotatorExtensionDeps =
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		// Start (or reuse) the single process-wide poller only once routing is
+		// configured and only from `session_start`: never at module/factory load.
+		// Idempotent, so a reload re-running the entry cannot create a second one.
+		if (state.router !== undefined && state.config !== undefined) ensurePoller(state, deps, now);
+
 		// Only claim to have published if this instance actually owns the symbol.
 		if (!publisher.owned) return;
 		if (resolveBridgeAccountHost(globalTarget) !== undefined) return;
@@ -265,6 +312,7 @@ export function activateExtension(pi: ExtensionAPI, deps: RotatorExtensionDeps =
 	});
 
 	pi.on("session_shutdown", () => {
+		state.poller?.stop();
 		publisher.unpublish();
 	});
 }
@@ -304,6 +352,40 @@ function commandStateFor(globalTarget: GlobalTarget): RotatorCommandState {
 	const created: RotatorCommandState = {};
 	globalTarget[COMMAND_STATE_KEY] = created;
 	return created;
+}
+
+/** Start the single shared poller, or reuse the running one. Called only from
+ *  `session_start`. The handle lives in the shared command state, so a `/reload`
+ *  that re-runs the entry finds `state.poller` running and never creates a
+ *  second one. `getTargets` reads the current router/config on every tick. */
+function ensurePoller(
+	state: RotatorCommandState,
+	deps: RotatorExtensionDeps,
+	now: () => number,
+): UsagePoller {
+	const existing = state.poller;
+	if (existing !== undefined && existing.isRunning()) return existing;
+	const poller = existing ?? new UsagePoller({
+		fetchUsage: deps.fetchUsage ?? ((usageOptions) => fetchPlanUsage({
+			configDir: usageOptions.configDir,
+			signal: usageOptions.signal,
+			now,
+		})),
+		getTargets: () => {
+			const router = state.router;
+			const config = state.config;
+			if (router === undefined || config === undefined) return undefined;
+			return { router, profiles: config.profiles };
+		},
+		now,
+		onWarn: deps.onWarn ?? ((message: string) => console.warn(message)),
+		setIntervalFn: deps.setIntervalFn,
+		clearIntervalFn: deps.clearIntervalFn,
+		setTimeoutFn: deps.setTimeoutFn,
+	});
+	state.poller = poller;
+	poller.start();
+	return poller;
 }
 
 function describeError(error: unknown): string {
